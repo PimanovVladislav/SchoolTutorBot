@@ -17,6 +17,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
+def utcnow() -> datetime:
+    return datetime.utcnow()
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -37,11 +41,15 @@ class User(Base):
     )
     role: Mapped[str] = mapped_column(String(32), default="student")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now()
+        DateTime, default=utcnow, server_default=func.now()
     )
 
-    track: Mapped[Optional["Track"]] = relationship(foreign_keys=[track_id])
-    subscriptions: Mapped[list["Subscription"]] = relationship(back_populates="user")
+    track: Mapped[Optional["Track"]] = relationship(
+        foreign_keys=[track_id], lazy="raise"
+    )
+    subscriptions: Mapped[list["Subscription"]] = relationship(
+        back_populates="user", lazy="raise"
+    )
 
 
 class Subscription(Base):
@@ -56,7 +64,7 @@ class Subscription(Base):
     source: Mapped[str] = mapped_column(String(32), default="admin")
     provider_payment_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    user: Mapped[User] = relationship(back_populates="subscriptions")
+    user: Mapped[User] = relationship(back_populates="subscriptions", lazy="raise")
 
 
 class Subject(Base):
@@ -67,7 +75,9 @@ class Subject(Base):
     title: Mapped[str] = mapped_column(String(255))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
-    tracks: Mapped[list["Track"]] = relationship(back_populates="subject")
+    tracks: Mapped[list["Track"]] = relationship(
+        back_populates="subject", lazy="selectin"
+    )
 
 
 class Track(Base):
@@ -81,8 +91,8 @@ class Track(Base):
     slug: Mapped[str] = mapped_column(String(64))
     title: Mapped[str] = mapped_column(String(255))
 
-    subject: Mapped[Subject] = relationship(back_populates="tracks")
-    topics: Mapped[list["Topic"]] = relationship(back_populates="track")
+    subject: Mapped[Subject] = relationship(back_populates="tracks", lazy="selectin")
+    topics: Mapped[list["Topic"]] = relationship(back_populates="track", lazy="raise")
 
 
 class Topic(Base):
@@ -101,8 +111,12 @@ class Topic(Base):
     theory: Mapped[str] = mapped_column(Text)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
-    track: Mapped[Track] = relationship(back_populates="topics")
-    problems: Mapped[list["Problem"]] = relationship(back_populates="topic")
+    track: Mapped[Track] = relationship(back_populates="topics", lazy="selectin")
+    problems: Mapped[list["Problem"]] = relationship(
+        back_populates="topic",
+        foreign_keys="Problem.topic_id",
+        lazy="raise",
+    )
 
 
 class Problem(Base):
@@ -123,7 +137,9 @@ class Problem(Base):
     solution: Mapped[str] = mapped_column(Text, default="")
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
-    topic: Mapped[Topic] = relationship(foreign_keys=[topic_id], back_populates="problems")
+    topic: Mapped[Topic] = relationship(
+        foreign_keys=[topic_id], back_populates="problems", lazy="raise"
+    )
 
 
 class LearningSession(Base):
@@ -135,7 +151,9 @@ class LearningSession(Base):
     topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"))
     stage: Mapped[str] = mapped_column(String(32), default="theory")
     status: Mapped[str] = mapped_column(String(32), default="active")
-    started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, server_default=func.now()
+    )
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
@@ -145,12 +163,16 @@ class Attempt(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    session_id: Mapped[int] = mapped_column(ForeignKey("learning_sessions.id", ondelete="CASCADE"))
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("learning_sessions.id", ondelete="CASCADE")
+    )
     problem_id: Mapped[int] = mapped_column(ForeignKey("problems.id"))
     submitted: Mapped[str] = mapped_column(String(255), default="")
     is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
     used_help: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utcnow, server_default=func.now()
+    )
 
 
 class TopicProgress(Base):
@@ -167,5 +189,5 @@ class TopicProgress(Base):
     reinforcement_total: Mapped[int] = mapped_column(Integer, default=0)
     mastery: Mapped[str] = mapped_column(String(32), default="not_started")
     last_activity_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
+        DateTime, default=utcnow, server_default=func.now(), onupdate=func.now()
     )

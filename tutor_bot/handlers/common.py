@@ -1,6 +1,8 @@
 from html import escape
 from typing import Optional
 
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tutor_bot.config import ADMIN_IDS
@@ -58,3 +60,15 @@ async def require_access(session: AsyncSession, user: User) -> Optional[str]:
     if info.allowed:
         return None
     return access_denied_text()
+
+
+async def safe_callback_answer(
+    callback: CallbackQuery,
+    text: Optional[str] = None,
+    *,
+    show_alert: bool = False,
+) -> None:
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except TelegramBadRequest:
+        pass

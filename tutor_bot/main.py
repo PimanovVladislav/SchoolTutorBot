@@ -11,8 +11,9 @@ from tutor_bot.config import BOT_TOKEN, REDIS_URL
 from tutor_bot.content import seed_curriculum
 from tutor_bot.db.engine import engine, session_factory
 from tutor_bot.db.models import Base
+from tutor_bot.handlers.errors import on_error
 from tutor_bot.handlers import setup_routers
-from tutor_bot.middlewares import DbSessionMiddleware
+from tutor_bot.middlewares import DbSessionMiddleware, TypingMiddleware
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +63,10 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=_storage())
+    dp.error.register(on_error)
     dp.update.middleware(DbSessionMiddleware(session_factory))
+    dp.message.middleware(TypingMiddleware())
+    dp.callback_query.middleware(TypingMiddleware())
     dp.include_router(setup_routers())
 
     await _set_commands(bot)

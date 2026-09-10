@@ -37,6 +37,7 @@ async def upsert_user(
         )
         session.add(user)
         await session.flush()
+        await session.refresh(user)
         return user
     user.username = username
     user.first_name = first_name

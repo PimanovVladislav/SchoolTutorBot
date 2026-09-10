@@ -201,8 +201,8 @@ async def open_topic(
     if topic is None:
         await callback.answer("Тема не найдена", show_alert=True)
         return
-    await callback.answer()
     await start_topic(callback.message, state, session, user, topic)
+    await callback.answer()
 
 
 @router.callback_query(LearnCB.filter(F.action == "training"), Learn.waiting_answer)
@@ -220,8 +220,8 @@ async def start_training(
         return
     await repos.set_session_stage(session, data["session_id"], "training")
     await state.update_data(stage="training", queue=queue, index=0)
-    await callback.answer()
     await _send_current_problem(callback.message, state, session)
+    await callback.answer()
 
 
 @router.callback_query(LearnCB.filter(F.action == "assessment"), Learn.waiting_answer)
@@ -239,9 +239,9 @@ async def start_assessment(
         return
     await repos.set_session_stage(session, data["session_id"], "assessment")
     await state.update_data(stage="assessment", queue=queue, index=0)
-    await callback.answer()
     await callback.message.answer("Проверочная. Пиши ответ сообщением.")
     await _send_current_problem(callback.message, state, session)
+    await callback.answer()
 
 
 @router.callback_query(LearnCB.filter(F.action == "hint"), Learn.waiting_answer)
