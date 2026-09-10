@@ -12,10 +12,10 @@ from tutor_bot.keyboards import (
     BTN_SUB,
     BTN_TOPICS,
     grade_keyboard,
-    main_menu,
+    menu_for,
     topics_keyboard,
 )
-from tutor_bot.services.scoring import MASTERY_LABELS
+from tutor_bot.services.chat import wipe_lesson
 from tutor_bot.states import Onboarding
 
 router = Router()
@@ -31,19 +31,20 @@ async def continue_learning(
     user = await ensure_user(session, message.from_user)
     if user.grade is None or user.track_id is None:
         await state.set_state(Onboarding.grade)
+        grades = await repos.list_grades(session)
         await message.answer(
-            "Сначала выбери класс.", reply_markup=grade_keyboard([6, 7, 8, 9])
+            "Сначала выбери класс.", reply_markup=grade_keyboard(grades)
         )
         return
     denied = await require_access(session, user)
     if denied:
-        await message.answer(denied, reply_markup=main_menu())
+        await message.answer(denied, reply_markup=menu_for(user.id))
         return
     topic = await _continue_topic(session, user)
     if topic is None:
         await message.answer(
             "Для твоего класса пока нет тем. Напиши репетитору.",
-            reply_markup=main_menu(),
+            reply_markup=menu_for(user.id),
         )
         return
     await start_topic(message, state, session, user, topic)
@@ -51,25 +52,38 @@ async def continue_learning(
 
 @router.message(F.text == BTN_TOPICS)
 @router.message(Command("topics"))
-async def list_topics(message: Message, session: AsyncSession) -> None:
+async def list_topics(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    await wipe_lesson(message.bot, message.chat.id, state)
+    await state.clear()
     user = await ensure_user(session, message.from_user)
     denied = await require_access(session, user)
     if denied:
-        await message.answer(denied, reply_markup=main_menu())
+        await message.answer(denied, reply_markup=menu_for(user.id))
         return
     if user.grade is None or user.track_id is None:
         await message.answer("Сначала пройди /start и выбери класс.")
         return
-    topics = await repos.list_topics_for_grade(session, user.track_id, user.grade)
-    if not topics:
+    rows = await repos.list_progress_with_topics(
+        session, user.id, user.track_id, user.grade
+    )
+    if not rows:
         await message.answer("Темы ещё не загружены.")
         return
-    await message.answer("Выбери тему:", reply_markup=topics_keyboard(list(topics)))
+    await message.answer(
+        "Выбери тему. Справа — прогресс по проверочной.",
+        reply_markup=topics_keyboard(rows),
+    )
 
 
 @router.message(F.text == BTN_PROGRESS)
 @router.message(Command("progress"))
-async def show_progress(message: Message, session: AsyncSession) -> None:
+async def show_progress(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    await wipe_lesson(message.bot, message.chat.id, state)
+    await state.clear()
     user = await ensure_user(session, message.from_user)
     if user.grade is None or user.track_id is None:
         await message.answer("Сначала выбери класс через /start.")
@@ -80,25 +94,12 @@ async def show_progress(message: Message, session: AsyncSession) -> None:
     if not rows:
         await message.answer("Для твоего класса пока нет тем.")
         return
-    lines = [f"<b>Прогресс · {user.grade} класс, математика</b>\n"]
-    for topic, progress in rows:
-        if progress is None:
-            lines.append(f"• {topic.title} — ещё не начата")
-            continue
-        mastery = MASTERY_LABELS.get(progress.mastery, progress.mastery)
-        score = (
-            f", проверка {progress.assessment_score:.0f}%"
-            if progress.assessment_score is not None
-            else ""
-        )
-        reinf = ""
-        if progress.reinforcement_total:
-            reinf = (
-                f", закрепление {progress.reinforcement_correct}/"
-                f"{progress.reinforcement_total}"
-            )
-        lines.append(f"• {topic.title} — {mastery}{score}{reinf}")
-    await message.answer("\n".join(lines), reply_markup=main_menu())
+    await message.answer(
+        f"<b>Прогресс · {user.grade} класс</b>\n"
+        "Справа — результат проверочной: «—» не начата, «…» в работе, "
+        "галочка — тема пройдена.",
+        reply_markup=topics_keyboard(rows),
+    )
 
 
 @router.message(F.text == BTN_SUB)

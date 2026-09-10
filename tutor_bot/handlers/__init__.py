@@ -1,6 +1,6 @@
 from aiogram import Router
 
-from tutor_bot.handlers import learn, menu, start, subscription
+from tutor_bot.handlers import admin, learn, menu, start, subscription
 
 
 def setup_routers() -> Router:
@@ -8,5 +8,6 @@ def setup_routers() -> Router:
     root.include_router(start.router)
     root.include_router(subscription.router)
     root.include_router(menu.router)
+    root.include_router(admin.router)
     root.include_router(learn.router)
     return root

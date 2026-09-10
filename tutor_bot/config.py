@@ -1,9 +1,12 @@
 import os
+from pathlib import Path
 from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _int_env(name: str, default: int) -> int:
@@ -35,6 +38,7 @@ TRIAL_DAYS = _int_env("TRIAL_DAYS", 3)
 STARS_PRICE = _int_env("STARS_PRICE", 0)
 REDIS_URL = os.getenv("REDIS_URL") or None
 WRONG_ATTEMPTS_BEFORE_HELP = _int_env("WRONG_ATTEMPTS_BEFORE_HELP", 2)
+TRAINING_REPEAT_DAYS = _int_env("TRAINING_REPEAT_DAYS", 7)
 POOL_SIZE = _int_env("DB_POOL_SIZE", 20)
 POOL_MAX_OVERFLOW = _int_env("DB_POOL_MAX_OVERFLOW", 40)
 

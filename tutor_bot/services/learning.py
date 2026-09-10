@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tutor_bot.db import repos
@@ -13,21 +15,26 @@ async def build_start_queue(
     topic: Topic,
     include_reinforcement: bool,
 ) -> list[int]:
-    """Очередь закрепления: id задач из ранее пройденных тем."""
     if not include_reinforcement or topic.track_id is None:
         return []
     problems = await repos.list_reinforcement_for_user(
         session, user_id, topic.track_id, topic.grade, topic.id
     )
-    # Не больше двух закреплений за раз, чтобы не перегружать урок.
-    return [p.id for p in problems[:2]]
+    if not problems:
+        return []
+    sample = problems[:]
+    random.shuffle(sample)
+    return [p.id for p in sample[:2]]
 
 
-async def load_kind_queue(
-    session: AsyncSession, topic_id: int, kind: str
-) -> list[int]:
-    problems = await repos.list_problems(session, topic_id, kind)
-    return [p.id for p in problems]
+async def pick_assessment_queue(session: AsyncSession, topic: Topic) -> list[int]:
+    problems = list(await repos.list_problems(session, topic.id, "assessment"))
+    if not problems:
+        return []
+    required = max(1, int(topic.assessment_required or 3))
+    count = min(required, len(problems))
+    chosen = random.sample(problems, count)
+    return [p.id for p in chosen]
 
 
 async def apply_assessment_score(

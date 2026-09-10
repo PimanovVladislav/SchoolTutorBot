@@ -108,13 +108,21 @@ class Topic(Base):
     slug: Mapped[str] = mapped_column(String(128))
     title: Mapped[str] = mapped_column(String(255))
     summary: Mapped[str] = mapped_column(String(512), default="")
-    theory: Mapped[str] = mapped_column(Text)
+    theory: Mapped[str] = mapped_column(Text, default="")
+    theory_kind: Mapped[str] = mapped_column(String(16), default="text")
+    theory_image_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    assessment_required: Mapped[int] = mapped_column(Integer, default=3)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
 
     track: Mapped[Track] = relationship(back_populates="topics", lazy="selectin")
     problems: Mapped[list["Problem"]] = relationship(
         back_populates="topic",
         foreign_keys="Problem.topic_id",
+        lazy="raise",
+    )
+    theories: Mapped[list["TopicTheory"]] = relationship(
+        back_populates="topic",
+        cascade="all, delete-orphan",
         lazy="raise",
     )
 
@@ -135,11 +143,79 @@ class Problem(Base):
     choices: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     hint: Mapped[str] = mapped_column(Text, default="")
     solution: Mapped[str] = mapped_column(Text, default="")
+    difficulty: Mapped[int] = mapped_column(Integer, default=1)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
 
     topic: Mapped[Topic] = relationship(
         foreign_keys=[topic_id], back_populates="problems", lazy="raise"
     )
+    hints: Mapped[list["ProblemHint"]] = relationship(
+        back_populates="problem",
+        cascade="all, delete-orphan",
+        lazy="raise",
+    )
+    solutions: Mapped[list["ProblemSolution"]] = relationship(
+        back_populates="problem",
+        cascade="all, delete-orphan",
+        lazy="raise",
+    )
+
+
+class TopicTheory(Base):
+    """Редакция объяснения темы: один topic_id, разные edition."""
+
+    __tablename__ = "topic_theories"
+    __table_args__ = (
+        UniqueConstraint("topic_id", "edition", name="uq_topic_theories_edition"),
+        Index("ix_topic_theories_topic", "topic_id", "edition"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"))
+    edition: Mapped[int] = mapped_column(Integer, default=1)
+    edition_count: Mapped[int] = mapped_column(Integer, default=1)
+    body: Mapped[str] = mapped_column(Text, default="")
+    kind: Mapped[str] = mapped_column(String(16), default="text")
+    image_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
+    topic: Mapped[Topic] = relationship(back_populates="theories", lazy="raise")
+
+
+class ProblemHint(Base):
+    __tablename__ = "problem_hints"
+    __table_args__ = (
+        UniqueConstraint("problem_id", "edition", name="uq_problem_hints_edition"),
+        Index("ix_problem_hints_problem", "problem_id", "edition"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    problem_id: Mapped[int] = mapped_column(
+        ForeignKey("problems.id", ondelete="CASCADE")
+    )
+    edition: Mapped[int] = mapped_column(Integer, default=1)
+    edition_count: Mapped[int] = mapped_column(Integer, default=1)
+    body: Mapped[str] = mapped_column(Text, default="")
+
+    problem: Mapped[Problem] = relationship(back_populates="hints", lazy="raise")
+
+
+class ProblemSolution(Base):
+    __tablename__ = "problem_solutions"
+    __table_args__ = (
+        UniqueConstraint("problem_id", "edition", name="uq_problem_solutions_edition"),
+        Index("ix_problem_solutions_problem", "problem_id", "edition"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    problem_id: Mapped[int] = mapped_column(
+        ForeignKey("problems.id", ondelete="CASCADE")
+    )
+    edition: Mapped[int] = mapped_column(Integer, default=1)
+    edition_count: Mapped[int] = mapped_column(Integer, default=1)
+    body: Mapped[str] = mapped_column(Text, default="")
+
+    problem: Mapped[Problem] = relationship(back_populates="solutions", lazy="raise")
 
 
 class LearningSession(Base):
@@ -191,3 +267,21 @@ class TopicProgress(Base):
     last_activity_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, server_default=func.now(), onupdate=func.now()
     )
+
+
+class GradeOption(Base):
+    __tablename__ = "grades"
+
+    grade: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+
+class UserProblemStat(Base):
+    __tablename__ = "user_problem_stats"
+    __table_args__ = (UniqueConstraint("user_id", "problem_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    problem_id: Mapped[int] = mapped_column(ForeignKey("problems.id", ondelete="CASCADE"))
+    last_solved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+

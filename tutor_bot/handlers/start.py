@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tutor_bot.db import repos
 from tutor_bot.handlers.common import ensure_user, greeting_name
-from tutor_bot.keyboards import GradeCB, grade_keyboard, main_menu
+from tutor_bot.keyboards import GradeCB, grade_keyboard, menu_for
 from tutor_bot.services.access import access_label, check_access
 from tutor_bot.states import Onboarding
 
@@ -33,16 +33,17 @@ async def cmd_start(
     name = greeting_name(user)
     if user.grade is None:
         await state.set_state(Onboarding.grade)
+        grades = await repos.list_grades(session)
         await message.answer(
             f"Привет, {name}!\n\n{INTRO}\n\nВыбери класс, чтобы подобрать программу:",
-            reply_markup=grade_keyboard([6, 7, 8, 9]),
+            reply_markup=grade_keyboard(grades),
         )
         return
     await message.answer(
         f"С возвращением, {name}!\n"
         f"Класс: {user.grade}. Доступ: {access_label(access)}.\n\n"
         f"{INTRO}",
-        reply_markup=main_menu(),
+        reply_markup=menu_for(user.id),
     )
 
 
@@ -66,17 +67,20 @@ async def onboarding_grade(
     )
     await callback.message.answer(
         "Можно начинать. Нажми «Продолжить обучение» или выбери тему.",
-        reply_markup=main_menu(),
+        reply_markup=menu_for(user.id),
     )
     await callback.answer()
 
 
 @router.message(Command("class"))
-async def cmd_class(message: Message, state: FSMContext) -> None:
+async def cmd_class(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
     await state.set_state(Onboarding.grade)
+    grades = await repos.list_grades(session)
     await message.answer(
         "Выбери класс — программа подстроится:",
-        reply_markup=grade_keyboard([6, 7, 8, 9]),
+        reply_markup=grade_keyboard(grades),
     )
 
 
@@ -85,5 +89,5 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Ок, задание сброшено. Можно выбрать тему заново.",
-        reply_markup=main_menu(),
+        reply_markup=menu_for(message.from_user.id),
     )

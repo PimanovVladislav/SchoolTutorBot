@@ -2,15 +2,25 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tutor_bot.content.math_school import MATH_SCHOOL_TOPICS
-from tutor_bot.db.models import Problem, Subject, Topic, Track
+from tutor_bot.db import repos
+from tutor_bot.db.models import GradeOption, Problem, Subject, Topic, Track
 
 
 async def seed_curriculum(session: AsyncSession) -> None:
+    await _ensure_grades(session)
     subject = await _get_or_create_subject(session)
     track = await _get_or_create_track(session, subject.id)
     for spec in MATH_SCHOOL_TOPICS:
         topic = await _upsert_topic(session, track.id, spec)
+        await _upsert_theories(session, topic, spec)
         await _replace_problems(session, topic.id, spec["problems"])
+
+
+async def _ensure_grades(session: AsyncSession) -> None:
+    for grade in (6, 7, 8, 9):
+        if await session.get(GradeOption, grade) is None:
+            session.add(GradeOption(grade=grade))
+    await session.flush()
 
 
 async def _get_or_create_subject(session: AsyncSession) -> Subject:
@@ -52,7 +62,10 @@ async def _upsert_topic(session: AsyncSession, track_id: int, spec: dict) -> Top
             slug=spec["slug"],
             title=spec["title"],
             summary=spec["summary"],
-            theory=spec["theory"],
+            theory=spec.get("theory") or "",
+            theory_kind=spec.get("theory_kind", "text"),
+            theory_image_path=spec.get("theory_image_path"),
+            assessment_required=int(spec.get("assessment_required", 3)),
             sort_order=spec["sort_order"],
         )
         session.add(topic)
@@ -60,9 +73,46 @@ async def _upsert_topic(session: AsyncSession, track_id: int, spec: dict) -> Top
         return topic
     topic.title = spec["title"]
     topic.summary = spec["summary"]
-    topic.theory = spec["theory"]
+    topic.theory = spec.get("theory") or ""
+    topic.theory_kind = spec.get("theory_kind", "text")
+    topic.theory_image_path = spec.get("theory_image_path")
+    topic.assessment_required = int(spec.get("assessment_required", 3))
     topic.sort_order = spec["sort_order"]
     return topic
+
+
+def _theory_specs(spec: dict) -> list[dict]:
+    if spec.get("theories"):
+        return list(spec["theories"])
+    if spec.get("theory") or spec.get("theory_image_path"):
+        return [
+            {
+                "kind": spec.get("theory_kind", "text"),
+                "body": spec.get("theory") or "",
+                "image_path": spec.get("theory_image_path"),
+            }
+        ]
+    return []
+
+
+def _text_list(spec: dict, plural: str, singular: str) -> list[str]:
+    if spec.get(plural):
+        return [item for item in spec[plural] if item]
+    if spec.get(singular):
+        return [spec[singular]]
+    return []
+
+
+async def _upsert_theories(session: AsyncSession, topic: Topic, spec: dict) -> None:
+    for index, item in enumerate(_theory_specs(spec), start=1):
+        await repos.upsert_topic_theory(
+            session,
+            topic.id,
+            index,
+            body=item.get("body") or "",
+            kind=item.get("kind") or "text",
+            image_path=item.get("image_path"),
+        )
 
 
 async def _replace_problems(
@@ -85,4 +135,18 @@ async def _replace_problems(
         problem.hint = spec.get("hint", "")
         problem.solution = spec.get("solution", "")
         problem.sort_order = spec["sort_order"]
+        if spec["kind"] == "training":
+            default_difficulty = ((spec["sort_order"] - 1) % 3) + 1
+        else:
+            default_difficulty = 2
+        problem.difficulty = int(spec.get("difficulty", default_difficulty))
+        if problem.difficulty < 1:
+            problem.difficulty = 1
         problem.source_topic_id = topic_id
+        await session.flush()
+        hints = _text_list(spec, "hints", "hint")
+        solutions = _text_list(spec, "solutions", "solution")
+        for index, body in enumerate(hints, start=1):
+            await repos.upsert_problem_hint(session, problem.id, index, body)
+        for index, body in enumerate(solutions, start=1):
+            await repos.upsert_problem_solution(session, problem.id, index, body)

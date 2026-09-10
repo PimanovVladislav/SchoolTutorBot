@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tutor_bot.config import ADMIN_IDS, STARS_PRICE
 from tutor_bot.db import repos
 from tutor_bot.handlers.common import ensure_user
-from tutor_bot.keyboards import LearnCB, main_menu, subscription_keyboard
+from tutor_bot.keyboards import LearnCB, menu_for, subscription_keyboard
 from tutor_bot.services.access import access_label, check_access, is_admin
 
 router = Router()
@@ -32,10 +32,12 @@ async def send_subscription_card(
         )
         if is_admin(user.id, user):
             text += (
-                "\n\nАдмин: <code>/grant telegram_id 30</code> — выдать 30 дней."
+                "\n\nАдмин: <code>/grant telegram_id_или_@username 30</code> — выдать 30 дней."
             )
     markup = subscription_keyboard(STARS_PRICE)
-    await message.answer(text, reply_markup=markup if STARS_PRICE > 0 else main_menu())
+    await message.answer(
+        text, reply_markup=markup if STARS_PRICE > 0 else menu_for(user.id)
+    )
 
 
 @router.message(Command("grant"))
@@ -44,29 +46,30 @@ async def cmd_grant(message: Message, session: AsyncSession) -> None:
         return
     parts = (message.text or "").split()
     if len(parts) < 3:
-        await message.answer("Формат: /grant telegram_id дни")
+        await message.answer("Формат: /grant telegram_id_или_@username дни")
         return
     try:
-        target_id = int(parts[1])
         days = int(parts[2])
     except ValueError:
-        await message.answer("telegram_id и дни должны быть числами.")
+        await message.answer("Число дней должно быть числом.")
         return
-    target = await repos.get_user(session, target_id)
+    target = await repos.find_user(session, parts[1])
+    if target is None and parts[1].lstrip("-").isdigit():
+        target = await repos.upsert_user(session, int(parts[1]), None, None, None)
     if target is None:
         await message.answer("Пользователь ещё не писал боту. Пусть нажмёт /start.")
         return
     sub = await repos.grant_subscription(
-        session, target_id, days, source="admin", now=datetime.utcnow()
+        session, target.id, days, source="admin", now=datetime.utcnow()
     )
     await message.answer(
-        f"Доступ пользователю {target_id} до {sub.ends_at.strftime('%d.%m.%Y %H:%M')} UTC."
+        f"Доступ пользователю {target.id} до {sub.ends_at.strftime('%d.%m.%Y %H:%M')} UTC."
     )
     try:
         await message.bot.send_message(
-            target_id,
+            target.id,
             f"Доступ открыт до {sub.ends_at.strftime('%d.%m.%Y')}. Можно заниматься.",
-            reply_markup=main_menu(),
+            reply_markup=menu_for(target.id),
         )
     except Exception:
         pass
@@ -131,5 +134,5 @@ async def successful_payment(message: Message, session: AsyncSession) -> None:
     )
     await message.answer(
         "Оплата прошла, доступ на 30 дней открыт. Можно заниматься.",
-        reply_markup=main_menu(),
+        reply_markup=menu_for(user.id),
     )

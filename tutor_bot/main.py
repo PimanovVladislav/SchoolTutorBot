@@ -10,10 +10,11 @@ from aiogram.types import BotCommand
 from tutor_bot.config import BOT_TOKEN, REDIS_URL
 from tutor_bot.content import seed_curriculum
 from tutor_bot.db.engine import engine, session_factory
-from tutor_bot.db.models import Base
+from tutor_bot.db.migrate import apply_schema
 from tutor_bot.handlers.errors import on_error
 from tutor_bot.handlers import setup_routers
 from tutor_bot.middlewares import DbSessionMiddleware, TypingMiddleware
+from tutor_bot.services.status import notify_admins
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +35,7 @@ def _storage():
 
 async def _init_db() -> None:
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(apply_schema)
     async with session_factory() as session:
         await seed_curriculum(session)
         await session.commit()
@@ -49,6 +50,7 @@ async def _set_commands(bot: Bot) -> None:
             BotCommand(command="topics", description="Выбрать тему"),
             BotCommand(command="progress", description="Мой прогресс"),
             BotCommand(command="subscribe", description="Подписка"),
+            BotCommand(command="cancel", description="Сбросить текущее задание"),
         ]
     )
 
@@ -72,8 +74,13 @@ async def main() -> None:
     await _set_commands(bot)
     logger.info("Bot polling started")
     try:
+        await notify_admins(bot, "Бот запущен")
         await dp.start_polling(bot)
     finally:
+        try:
+            await notify_admins(bot, "Бот выключен")
+        except Exception:
+            logger.exception("Failed to notify admins about shutdown")
         await bot.session.close()
         await engine.dispose()
 
