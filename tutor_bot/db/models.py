@@ -1,0 +1,171 @@
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    first_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    grade: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    track_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tracks.id"), nullable=True
+    )
+    current_topic_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("topics.id"), nullable=True
+    )
+    role: Mapped[str] = mapped_column(String(32), default="student")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now()
+    )
+
+    track: Mapped[Optional["Track"]] = relationship(foreign_keys=[track_id])
+    subscriptions: Mapped[list["Subscription"]] = relationship(back_populates="user")
+
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    __table_args__ = (Index("ix_subscriptions_user_ends", "user_id", "ends_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    starts_at: Mapped[datetime] = mapped_column(DateTime)
+    ends_at: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    source: Mapped[str] = mapped_column(String(32), default="admin")
+    provider_payment_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    user: Mapped[User] = relationship(back_populates="subscriptions")
+
+
+class Subject(Base):
+    __tablename__ = "subjects"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True)
+    title: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    tracks: Mapped[list["Track"]] = relationship(back_populates="subject")
+
+
+class Track(Base):
+    """Направление: школьная программа, ОГЭ, ЕГЭ, доп. образование."""
+
+    __tablename__ = "tracks"
+    __table_args__ = (UniqueConstraint("subject_id", "slug"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id", ondelete="CASCADE"))
+    slug: Mapped[str] = mapped_column(String(64))
+    title: Mapped[str] = mapped_column(String(255))
+
+    subject: Mapped[Subject] = relationship(back_populates="tracks")
+    topics: Mapped[list["Topic"]] = relationship(back_populates="track")
+
+
+class Topic(Base):
+    __tablename__ = "topics"
+    __table_args__ = (
+        UniqueConstraint("track_id", "grade", "slug"),
+        Index("ix_topics_track_grade_order", "track_id", "grade", "sort_order"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id", ondelete="CASCADE"))
+    grade: Mapped[int] = mapped_column(Integer)
+    slug: Mapped[str] = mapped_column(String(128))
+    title: Mapped[str] = mapped_column(String(255))
+    summary: Mapped[str] = mapped_column(String(512), default="")
+    theory: Mapped[str] = mapped_column(Text)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    track: Mapped[Track] = relationship(back_populates="topics")
+    problems: Mapped[list["Problem"]] = relationship(back_populates="topic")
+
+
+class Problem(Base):
+    __tablename__ = "problems"
+    __table_args__ = (Index("ix_problems_topic_kind", "topic_id", "kind", "sort_order"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"))
+    source_topic_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("topics.id"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(32))  # training | assessment | reinforcement
+    answer_type: Mapped[str] = mapped_column(String(32))
+    prompt: Mapped[str] = mapped_column(Text)
+    correct_answer: Mapped[str] = mapped_column(String(255))
+    choices: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    hint: Mapped[str] = mapped_column(Text, default="")
+    solution: Mapped[str] = mapped_column(Text, default="")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+
+    topic: Mapped[Topic] = relationship(foreign_keys=[topic_id], back_populates="problems")
+
+
+class LearningSession(Base):
+    __tablename__ = "learning_sessions"
+    __table_args__ = (Index("ix_sessions_user_active", "user_id", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id"))
+    stage: Mapped[str] = mapped_column(String(32), default="theory")
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class Attempt(Base):
+    __tablename__ = "attempts"
+    __table_args__ = (Index("ix_attempts_session", "session_id", "problem_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    session_id: Mapped[int] = mapped_column(ForeignKey("learning_sessions.id", ondelete="CASCADE"))
+    problem_id: Mapped[int] = mapped_column(ForeignKey("problems.id"))
+    submitted: Mapped[str] = mapped_column(String(255), default="")
+    is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
+    used_help: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TopicProgress(Base):
+    __tablename__ = "topic_progress"
+    __table_args__ = (UniqueConstraint("user_id", "topic_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"))
+    theory_done: Mapped[bool] = mapped_column(Boolean, default=False)
+    training_done: Mapped[bool] = mapped_column(Boolean, default=False)
+    assessment_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    reinforcement_correct: Mapped[int] = mapped_column(Integer, default=0)
+    reinforcement_total: Mapped[int] = mapped_column(Integer, default=0)
+    mastery: Mapped[str] = mapped_column(String(32), default="not_started")
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )

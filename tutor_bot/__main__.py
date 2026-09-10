@@ -1,5 +1,6 @@
-from tutor_bot.main import main
 import asyncio
+
+from tutor_bot.main import main
 
 if __name__ == "__main__":
     try:
