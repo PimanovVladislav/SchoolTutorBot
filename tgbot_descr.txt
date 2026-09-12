@@ -1,0 +1,1579 @@
+Руководство по Telegram-боту tutor_bot
+======================================
+
+Для кого этот файл
+------------------
+Это текстовое руководство для начинающего программиста. Цель — разобрать
+этот проект от нуля: как вообще устроен любой Telegram-бот, как устроен
+именно этот, какой файл за что отвечает, какая функция что делает, какие
+аргументы принимает, куда уходит управление после нажатия кнопки.
+
+Схема таблиц БД здесь не дублируется целиком: живое описание колонок и
+CREATE TABLE лежит в db_descr.txt. Здесь — как бот с этой базой общается.
+
+Стек: Python 3, aiogram 3, SQLAlchemy 2 async + asyncmy, MySQL utf8mb4,
+опционально Redis для FSM. Запуск: python main.py (один процесс на токен).
+
+
+========================================================================
+ЧАСТЬ 1. КАК УСТРОЕН ЛЮБОЙ TELEGRAM-БОТ
+========================================================================
+
+1.1. Кто с кем разговаривает
+----------------------------
+Telegram — это мессенджер. Бот — обычный «пользователь» с особым API.
+
+Три стороны:
+
+  1) Клиент ученика (приложение Telegram на телефоне или Desktop).
+  2) Серверы Telegram. Они хранят чаты, кнопки, файлы, очередь апдейтов.
+  3) Твой Python-процесс. Он НЕ слушает интернет ученика напрямую.
+     Он говорит только с API Telegram.
+
+Цепочка одного нажатия кнопки:
+
+  ученик нажал кнопку
+    → Telegram принял жест
+    → Telegram положил «апдейт» (update) в очередь бота
+    → твой процесс забрал апдейт (polling или webhook)
+    → aiogram подобрал хендлер (функцию-обработчик)
+    → хендлер решил, что ответить
+    → процесс вызывает Bot API: sendMessage / editMessageText / ...
+    → Telegram показывает ответ ученику
+
+Важно: бот не «сидит в чате» как человек. Он реагирует на апдейты и
+шлёт команды API. Если процесс выключен, кнопки ученика копятся у
+Telegram и придут пачкой, когда бот снова запустится (у polling есть
+лимит давности).
+
+1.2. Токен
+----------
+Токен выдаёт @BotFather. Это секрет, которым процесс доказывает, что он
+и есть этот бот. Лежит в .env как BOT_TOKEN. Его нельзя коммитить.
+
+Любой HTTP-запрос к API выглядит как:
+  https://api.telegram.org/bot<TOKEN>/<method>
+
+aiogram прячет это за объектом Bot.
+
+1.3. Апдейт (Update)
+--------------------
+Апдейт — JSON-пакет «что-то случилось». В одном апдейте обычно одно из:
+
+  message            — новое сообщение (текст, фото, команда /start)
+  edited_message     — ученик отредактировал своё сообщение
+  callback_query     — нажата inline-кнопка под сообщением
+  pre_checkout_query — Telegram спрашивает: можно ли провести оплату
+  successful_payment — оплата прошла
+  и другие типы, которые этот бот не обрабатывает
+
+Поле update_id монотонно растёт. По нему Telegram понимает, что уже
+доставлено.
+
+1.4. Polling и webhook
+----------------------
+Два способа получать апдейты.
+
+Polling (этот проект): процесс крутит цикл getUpdates. Просто, удобно
+для разработки. Минус: нужен постоянно работающий процесс; два процесса
+с одним токеном будут драться за очередь.
+
+Webhook: Telegram сам POST-ит апдейты на твой HTTPS URL. Нужен публичный
+сервер. На нагрузке это правильнее, плюс несколько воркеров с общим Redis.
+
+В tutor_bot/main.py вызывается dp.start_polling(bot). Webhook не настроен.
+
+1.5. Bot и Dispatcher (aiogram 3)
+---------------------------------
+Bot     — клиент API: send_message, delete_message, answer_callback_query.
+Dispatcher — маршрутизатор: смотрит на апдейт и ищет хендлер.
+
+Хендлер — async-функция с декоратором вроде:
+
+  @router.message(CommandStart())
+  async def cmd_start(message: Message, state: FSMContext, session: AsyncSession):
+      ...
+
+aiogram сам подставляет аргументы по имени:
+
+  message / callback / event  — объект из апдейта
+  state                       — FSM этого пользователя (см. ниже)
+  session                     — мы кладём в data через middleware
+  bot                         — кладётся фреймворком
+  callback_data               — если фильтр CallbackData.filter()
+
+Если имя аргумента aiogram не знает, будет ошибка. Новые зависимости
+добавляют через middleware: data["session"] = session.
+
+1.6. Router и порядок
+---------------------
+Router — коробка с хендлерами. Их включают в Dispatcher или в другой
+Router. Порядок include_router важен: первый подходящий хендлер побеждает.
+
+В этом проекте (tutor_bot/handlers/__init__.py setup_routers):
+
+  1. start         — /start, выбор предмета и класса, /cancel, /class
+  2. subscription  — /grant, /revoke, /stats, оплата Stars
+  3. student       — главное меню, обучение-список, прогресс, настройки,
+                     навигация Назад/На главную, вся проверочная
+  4. admin         — админка; на роутере стоит фильтр AdminOnly
+  5. learn         — теория, тренировка, подсказка, разбор, ответ на задачу
+
+Почему student раньше learn: кнопки «Назад», «На главную», «Завершить
+работу» должны перехватываться student, а не попадать в handle_answer
+как «ответ ученика».
+
+Почему admin раньше learn: текст «Отмена» и админ-кнопки не должны
+считаться ответом на задачу.
+
+1.7. Фильтры
+------------
+Хендлер срабатывает, только если все фильтры в декораторе истинны.
+
+Примеры из проекта:
+
+  CommandStart()              — текст сообщения это /start или /start payload
+  Command("learn")            — /learn
+  F.text == BTN_HOME          — текст в точности «На главную»
+  F.text.in_({...})           — текст из множества
+  F.text.regexp(r"...")       — текст подходит под регулярку
+  ~F.text.startswith("/")     — текст НЕ начинается с /
+  ~F.text.in_(NAV_BUTTONS)    — текст не является служебной кнопкой
+  StateFilter(Learn.exam_work, Learn.exam_answer)
+                              — текущее FSM-состояние одно из двух
+  Learn.waiting_answer        — то же, коротко: состояние равно этому
+  MenuCB.filter(F.a == "hm")  — нажата inline-кнопка с action hm
+  SubjectCB.filter()          — любая inline-кнопка предмета
+  AdminOnly()                 — кастомный фильтр: user.id в ADMIN_IDS
+
+F — magic-filter aiogram. F.text значит «поле text апдейта».
+
+1.8. Два вида клавиатур. Это критично
+-------------------------------------
+Telegram разрешает ОДНУ reply_markup на сообщение. Либо нижняя
+клавиатура, либо кнопки под сообщением, не оба сразу.
+
+A) Reply keyboard (обычная клавиатура внизу чата)
+   Класс: ReplyKeyboardMarkup, кнопки KeyboardButton.
+   Видна постоянно, пока бот не пришлёт другую или ReplyKeyboardRemove.
+   Нажатие = обычное текстовое сообщение. Хендлер ловит F.text == "...".
+   В этом проекте главное меню, разделы, проверочная, админка — такие.
+
+   Нюанс Telegram Desktop: клавиатура «привязана» к сообщению, с которым
+   её прислали. Если это сообщение сразу удалить, меню на Desktop
+   мигает и пропадает. Поэтому бот держит «живого владельца»
+   клавиатуры (reply_kb_id) и никогда не шлёт пустой символ-заглушку.
+
+B) Inline keyboard (кнопки под конкретным сообщением)
+   Класс: InlineKeyboardMarkup, кнопки InlineKeyboardButton.
+   Нажатие = callback_query, не сообщение в чат.
+   callback_data — короткая строка (лимит Telegram 64 байта).
+   В этом проекте: выбор предмета/класса, подсказка/разбор/пропуск
+   на карточке задачи, оплата Stars, пагинация учеников в админке.
+
+После обработки callback ОБЯЗАТЕЛЬНО вызвать callback.answer().
+Иначе у ученика бесконечные часики на кнопке. Текст в answer() —
+короткий тост; show_alert=True — модальное окно.
+
+1.9. Команды и кнопка Menu
+--------------------------
+BotFather и метод setMyCommands публикуют список /start, /learn...
+Тогда в клиенте появляется кнопка Menu со слэш-командами.
+
+Этот бот при старте вызывает bot.delete_my_commands(), чтобы Menu
+не показывала /start-/learn-/settings. Действия живут на нижней
+клавиатуре. Сами хендлеры Command("learn") и т.п. оставлены: если
+человек сам напишет /learn, это сработает.
+
+/start остаётся штатным входом: его можно набрать вручную, он есть
+у каждого бота с самого создания.
+
+1.10. FSM (конечный автомат)
+----------------------------
+«Состояние» пользователя хранится отдельно от хендлеров.
+
+StatesGroup — набор имён состояний (tutor_bot/states.py).
+FSMContext — объект, чтобы читать/писать состояние и data.
+
+  await state.set_state(Learn.waiting_answer)
+  await state.get_state()            # строка вроде "Learn:waiting_answer"
+  await state.update_data(topic_id=5)
+  data = await state.get_data()      # dict
+  await state.clear()                # стереть состояние и data
+
+Хранилище:
+  MemoryStorage — в RAM процесса. Пропал процесс — пропали состояния.
+  RedisStorage  — если задан REDIS_URL. Нужен, когда ботов несколько.
+
+Ключ FSM в aiogram по умолчанию: (bot_id, chat_id, user_id).
+В личке chat_id == user_id.
+
+Этот бот кладёт в data не только поля формы, но и стек экранов,
+id сообщений для удаления, id текущей задачи. Это не «магия FSM»,
+это просто dict, который переживёт апдейты.
+
+1.11. HTML в сообщениях
+-----------------------
+Bot создаётся с ParseMode.HTML. Значит в тексте можно:
+
+  <b>жирный</b>  <i>курсив</i>  <code>моно</code>  <a href="...">ссылка</a>
+
+Любой пользовательский ввод (имя, название темы) нужно экранировать
+html.escape, иначе «<» сломает разметку или откроет дыру.
+
+Лимит Telegram на текст сообщения — 4096 символов. В проекте режут
+по 3900 (RESULT_LIMIT) и 4000 (THEORY_LIMIT), с запасом.
+
+1.12. Идентификаторы
+--------------------
+user.id / from_user.id — Telegram id человека. В users.id хранится он же,
+не автоинкремент. Это важно: send_message(target.id) шлёт в личку.
+
+message_id — номер сообщения в чате. Удаление и правка идут по паре
+(chat_id, message_id).
+
+callback_data — не путать с id. Это наша короткая строка на кнопке.
+
+
+========================================================================
+ЧАСТЬ 2. ЧТО ЭТО ЗА БОТ И КАК УЧЕНИК ПО НЕМУ ИДЁТ
+========================================================================
+
+Продукт: репетитор в Telegram. Сейчас контент — школьная математика
+6–9 классов. Ядро рассчитано на несколько предметов и треков (школа,
+ОГЭ, ЕГЭ) без нового бота.
+
+Путь ученика:
+
+  /start
+    нет класса/предмета → онбординг (inline: предмет, потом класс)
+    есть               → приветствие + ГЛАВНОЕ МЕНЮ (reply)
+
+  Главное меню (только здесь эти три кнопки):
+    «Продолжить обучение» → список несданных тем + «Начать с N»
+    «Мой прогресс»        → сданные на 3+ темы, номер или «и1» для истории
+    «Настройки»           → класс/предмет, подписка, обращение, расписание
+    «Админка»             → только если user_id в ADMIN_IDS
+
+  Тема:
+    теория (можно ещё одну редакцию) → тренировка → проверочная
+
+  Тренировка:
+    задача с inline: Подсказка / Разбор / Пропуск / жалоба
+    после верного ответа снизу: Решить ещё, уровни, К проверочной
+
+  Проверочная:
+    снизу список заданий «N · Нет ответа» / «N · ответ отправлен»
+    плюс Завершить работу, Назад, На главную
+    ответы копятся, оценка ставится только при завершении или истечении
+    срока (ASSESSMENT_HOURS, по умолчанию 24 часа)
+
+  Результат:
+    снизу «N · верно/неверно/нет ответа» — раскрывает разбор задания
+
+На любом экране кроме дома: Назад (снять текущий экран, вернуть
+предыдущий) и На главную (стереть UI, показать HOME_TEXT).
+
+
+========================================================================
+ЧАСТЬ 3. ДЕРЕВО ПРОЕКТА: КАКОЙ ФАЙЛ ЗА ЧТО
+========================================================================
+
+Корень репозитория
+------------------
+main.py                 Точка входа: asyncio.run(tutor_bot.main.main).
+                        Можно запускать python main.py из корня.
+
+requirements.txt        Зависимости pip.
+
+.env                    Секреты. Не коммитить. Образец — .env.example.
+
+.env.example            Имена переменных без секретов.
+
+db_descr.txt            Живая схема MySQL. Обновлять вместе с моделями.
+
+tgbot_descr.txt         Этот файл.
+
+README.md               Краткий обзор для человека, который клонирует репо.
+                        Часть команд в таблице README может отставать от
+                        кода: ориентир по поведению — этот файл и код.
+
+tests/                  pytest. Запуск:
+                        .venv\Scripts\python.exe -m pytest tests -q
+
+media/                  Картинки теории, формулы matplotlib, загрузки админки.
+
+Пакет tutor_bot/
+----------------
+__init__.py             Пустой. Пакет python.
+
+__main__.py             python -m tutor_bot — тот же запуск, что main.py.
+
+main.py                 Сборка Bot + Dispatcher, БД, polling, уведомление
+                        админов о старте/стопе.
+
+config.py               Чтение .env, константы, DATABASE_URL.
+
+states.py               Имена FSM-состояний. Не логика, только ярлыки.
+
+keyboards.py            ВСЕ клавиатуры и CallbackData. Тексты кнопок —
+                        константы BTN_*. Сюда же парсеры «1 · Нет ответа».
+
+Модуль handlers/ — реакция на апдейты
+-------------------------------------
+__init__.py             setup_routers(): склеивает роутеры в нужном порядке.
+
+start.py                /start, онбординг предмета/класса, /class, /cancel.
+
+student.py              Главное меню ученика, списки тем, настройки,
+                        навигация, вся проверочная и её результат.
+
+learn.py                Теория, тренировка, проверка ответа, подсказка,
+                        разбор, пропуск, жалоба на задание.
+
+admin.py                Админ-панель: контент, ученики, доступ, жалобы.
+                        Роутер целиком закрыт фильтром AdminOnly.
+
+subscription.py         Карточка доступа, Stars, /grant /revoke /stats.
+
+common.py               Общие хелперы: ensure_user, require_access,
+                        split_html, greeting_name, safe_callback_answer.
+
+errors.py               Глобальный on_error: лог + «нажми /start».
+
+menu.py                 Пустой Router. Исторический файл, в setup_routers
+                        не подключается. Можно игнорировать.
+
+Модуль services/ — логика без Telegram-декораторов
+-------------------------------------------------
+nav.py                  Стек экранов, учёт message_id, владелец reply-
+                        клавиатуры, wipe_ui.
+
+chat.py                 Удаление сообщений, учёт теории/задач/панели экзамена.
+
+access.py               Кому можно заниматься: админ / подписка / триал.
+
+answers.py              Сравнение ответа ученика с эталоном (дроби, списки).
+
+grades.py               Пороги оценок 3/4/5/5+, текст правил проверочной,
+                        формат дат в Москве.
+
+scoring.py              Баллы тренировочной сессии и подписи mastery
+                        (старый контур оценки; проверочная ученика идёт
+                        через grades.py + assessment_attempts).
+
+learning.py             Выбор задач проверочной, закрепление, старый
+                        подсчёт assessment_score.
+
+richtext.py             HTML теории → пачка сообщений: текст, фото, видео,
+                        формулы matplotlib.
+
+status.py               notify_admins: служебные сообщения админам.
+
+topics.py               Как вставить тему в середину нумерации класса.
+
+Модуль db/
+----------
+engine.py               Async engine и session_factory.
+
+models.py               ORM-таблицы.
+
+migrate.py              create_all + ALTER для колонок, появившихся позже.
+
+repos.py                Все SQL-запросы приложения. Хендлеры не пишут
+                        select() сами, кроме редких session.get.
+
+Модуль middlewares/
+-------------------
+db.py                   Открывает AsyncSession, кладёт в data["session"],
+                        после хендлера commit.
+
+typing.py               Пока хендлер работает, в чате «печатает…».
+
+Модуль content/
+---------------
+math_school.py          Стартовые темы и задачи (словари Python).
+
+seed.py                 При старте бота заливает/обновляет этот контент в БД.
+
+
+========================================================================
+ЧАСТЬ 4. КОНФИГ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+========================================================================
+
+Файл tutor_bot/config.py читает .env через python-dotenv (load_dotenv).
+
+Вспомогательные функции
+-----------------------
+_int_env(name, default)
+  Берёт os.getenv(name). Пусто или нет ключа → default.
+  Иначе int(...). Нужна, чтобы TRIAL_DAYS="3" стало числом.
+
+_admin_ids()
+  Читает ADMIN_IDS — строка через запятую, например "111,222".
+  Возвращает frozenset[int]. Пустая строка → пустое множество.
+  Человек из этого множества видит кнопку «Админка» и проходит AdminOnly.
+
+Константы
+---------
+PROJECT_ROOT
+  Path к корню репозитория (родитель tutor_bot/). Нужен, чтобы
+  media/... резолвились одинаково, откуда бы ни запустили процесс.
+
+BOT_TOKEN
+  Токен BotFather. Пустой → main() бросает RuntimeError.
+
+DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+  Подключение к MySQL. Порт по умолчанию 3306, база tutor_bot.
+
+DATABASE_URL
+  Собирается сам: mysql+asyncmy://user:pass@host:port/name?charset=utf8mb4
+  Пароль прогоняется через quote_plus, чтобы спецсимволы не ломали URL.
+
+ADMIN_IDS
+  frozenset Telegram id админов.
+
+TRIAL_DAYS (int, default 3)
+  Сколько суток после users.created_at можно заниматься без подписки.
+  0 — триала нет.
+
+STARS_PRICE (int, default 0)
+  Цена 30 дней в Telegram Stars. 0 — кнопка оплаты не показывается,
+  доступ выдаёт админ командой /grant или кнопкой в админке.
+
+REDIS_URL (str | None)
+  Если задан — FSM в Redis. Если нет — MemoryStorage.
+  Для двух процессов с одним токеном Redis обязателен, иначе состояния
+  каждого процесса свои, и ученик «ломается».
+
+WRONG_ATTEMPTS_BEFORE_HELP (default 2)
+  После скольких неверных ответов на тренировке появляется
+  «Помощь · разбор».
+
+TRAINING_REPEAT_DAYS (default 7)
+  Кулдаун: недавно решённую тренировочную задачу не давать снова.
+
+ASSESSMENT_HOURS (default 24)
+  Срок проверочной от started_at до deadline_at.
+
+POOL_SIZE (DB_POOL_SIZE, default 20)
+POOL_MAX_OVERFLOW (DB_POOL_MAX_OVERFLOW, default 40)
+  Пул соединений SQLAlchemy. На много учеников увеличивать вместе
+  с лимитами MySQL.
+
+
+========================================================================
+ЧАСТЬ 5. ЗАПУСК ПРОЦЕССА (tutor_bot/main.py)
+========================================================================
+
+Цепочка python main.py:
+
+  1) asyncio.run(main())
+  2) Если BOT_TOKEN пуст — падение с понятной ошибкой.
+  3) _init_db():
+       engine.begin() → apply_schema (таблицы + ALTER)
+       session_factory() → seed_curriculum (математика 6–9)
+       commit
+  4) Bot(token, default parse_mode=HTML)
+  5) Dispatcher(storage=_storage())
+       Redis, если REDIS_URL, иначе память
+  6) dp.error.register(on_error)
+  7) dp.update.middleware(DbSessionMiddleware)  — на КАЖДЫЙ апдейт
+  8) dp.message.middleware(TypingMiddleware)
+     dp.callback_query.middleware(TypingMiddleware)
+     (на pre_checkout typing не вешается — там нет «печатает»)
+  9) dp.include_router(setup_routers())
+ 10) bot.delete_my_commands()  — спрятать Menu со слэш-командами
+ 11) notify_admins("Бот запущен")
+ 12) dp.start_polling(bot)     — бесконечный цикл, пока не Ctrl+C
+ 13) finally: «Бот выключен», bot.session.close(), engine.dispose()
+
+Функции файла
+-------------
+_storage()
+  Аргументов нет. Возвращает RedisStorage.from_url(REDIS_URL) или
+  MemoryStorage(). Вызывать только отсюда.
+
+_init_db()
+  Аргументов нет. Создаёт схему и сидирует контент. Идемпотентно:
+  повторный старт не дублирует темы, а обновляет тексты из math_school.py.
+
+_set_commands(bot: Bot)
+  Сейчас только await bot.delete_my_commands().
+  Если снова понадобится Menu, здесь был бы bot.set_my_commands([
+    BotCommand(command="start", description="..."), ...
+  ]).
+  Опционально можно передать scope=BotCommandScopeAllPrivateChats() —
+  тогда команды только в личках, не в группах.
+
+main()
+  Точка сборки, см. цепочку выше.
+
+
+========================================================================
+ЧАСТЬ 6. MIDDLEWARE
+========================================================================
+
+6.1. DbSessionMiddleware (middlewares/db.py)
+-------------------------------------------
+__init__(self, session_factory)
+  Запоминает фабрику сессий.
+
+__call__(self, handler, event, data)
+  Открывает async with session_factory() as session:
+    data["session"] = session
+    result = await handler(...)
+    await session.commit()
+    return result
+
+Следствия:
+  - каждый хендлер может объявить session: AsyncSession
+  - commit автоматический, если хендлер не упал
+  - если хендлер бросил исключение, commit не будет (сессия закроется
+    с rollback по контекстному менеджеру)
+  - не держи сессию дольше одного апдейта и не клади объекты ORM
+    в FSM data: после закрытия сессии они expire
+
+6.2. TypingMiddleware (middlewares/typing.py)
+--------------------------------------------
+Пока хендлер думает, шлёт chat action typing (через 0.25 с).
+Если bot или chat_id не найдены — просто вызывает handler.
+
+_chat_id(event)
+  Message → event.chat.id
+  CallbackQuery с message → message.chat.id
+  иначе None (например, pre_checkout)
+
+
+========================================================================
+ЧАСТЬ 7. FSM-СОСТОЯНИЯ (tutor_bot/states.py)
+========================================================================
+
+Onboarding
+  subject  — ждём callback SubjectCB (выбор предмета)
+  grade    — ждём callback GradeCB (выбор класса)
+
+Learn
+  pick_topic      — список тем/прогресс: ждём номер, «и1» или «Начать с N»
+  waiting_answer  — теория или тренировка: ждём текст ответа ИЛИ кнопки
+                    К тренировке / К проверочной / Решить ещё / ...
+  exam_work       — проверочная, задание не открыто: ждём кнопку задания
+                    или «Завершить работу»
+  exam_answer     — открыто конкретное задание: следующее текстовое
+                    сообщение (не кнопка навигации) = ответ
+
+Admin  (пошаговые мастера)
+  subject_title, grade_number,
+  topic_title, topic_summary, topic_theory, topic_assessment, topic_number,
+  problem_prompt, problem_answer, problem_hint, problem_solution,
+  extra_theory, extra_hint, extra_solution,
+  grant_target, grant_days
+
+Состояние None (сброшено) — «дома» или результат проверочной, или
+просто нет активного ввода. Кнопки главного меню ловятся без состояния.
+
+
+========================================================================
+ЧАСТЬ 8. КЛАВИАТУРЫ И CALLBACK-ДАННЫЕ (keyboards.py)
+========================================================================
+
+8.1. Лимиты и тексты кнопок
+---------------------------
+BUTTON_TEXT_LIMIT = 64
+  Лимит Telegram на подпись inline-кнопки. fit_button_text обрезает
+  с многоточием.
+
+BTN_* — человеческие подписи reply-кнопок. Их нельзя менять в одном
+месте и забыть в хендлере: сравнение идёт по точному тексту.
+Все служебные тексты собраны в множество NAV_BUTTONS. Фильтр
+~F.text.in_(NAV_BUTTONS) не даёт «Назад» стать ответом «неверно».
+
+«Начать с 3» в NAV_BUTTONS нет: номер динамический. Для неё отдельный
+хендлер с regexp и parse_start_from_button.
+
+DIFFICULTY_LABELS = {1: "лёгкий", 2: "средний", 3: "сложный"}
+
+8.2. CallbackData (префиксы)
+----------------------------
+aiogram упаковывает поля в строку. prefix отличает типы кнопок.
+
+SubjectCB prefix="sj"   subject_id: int
+GradeCB   prefix="g"    grade: int
+TopicCB   prefix="t"    action: str, topic_id: int
+LearnCB   prefix="l"    action: str
+  action: theory_more, training, assessment, more, level_up, level_down,
+          hint, help, skip, report, pay
+MenuCB    prefix="m"    a: str, t: int=0, i: int=0
+  a — короткое действие, t/i — id темы/попытки/номера задания
+  Значения a, которые ещё живы в хендлерах:
+    hm  На главную (устаревшие inline, если в чате остались старые кнопки)
+    bk  Назад
+    th  открыть теорию темы t
+    st  начать с темы t
+    ex  карточка проверочной темы t
+    go  приступить к проверочной t
+    qi  открыть задание i темы t (старый inline)
+    fi  завершить работу t
+    dt  детали попытки t
+    dq  раскрыть задание i попытки t
+    hs  история темы t
+    sc  сменить класс
+    sb  заглушка настроек, i=1 подписка, 2 обращение, 3 расписание
+AdminCB prefix="ad"     a: str, i: int=0
+  users, grant30, revoke, и шаги мастеров контента
+
+Старые inline-клавиатуры (learn_start_keyboard, theory_keyboard,
+settings_keyboard, exam_start_keyboard, exam_result_keyboard) оставлены
+в файле, чтобы нажатия по СТАРЫМ сообщениям в чате не умирали. Новые
+экраны рисуют reply-клавиатуры.
+
+8.3. Фабрики reply-клавиатур
+----------------------------
+main_menu(*, admin=False)
+  Только дом: Продолжить обучение, Мой прогресс, Настройки.
+  Если admin=True — ещё ряд «Админка».
+  is_persistent=True — клиент старается не прятать клавиатуру.
+
+menu_for(user_id)
+  main_menu(admin=user_id in ADMIN_IDS). Удобно, когда есть только id.
+
+section_keyboard(extra_rows=None, *, admin=False)
+  Сначала extra_rows (список рядов строк), потом ряд Назад | На главную,
+  потом опционально Админка. Это шаблон ВСЕХ не-домашних экранов.
+
+section_for(user_id, extra_rows=None)
+  То же с автоопределением админа.
+
+learn_reply_keyboard(start_number, *, admin=False)
+  Ряд «Начать с {start_number}» + section.
+
+exam_start_reply_keyboard(*, admin=False)
+  Ряд «Приступить» + section.
+
+theory_reply_keyboard(*, can_more=True, admin=False)
+  «Всё ещё непонятно» если can_more, «К тренировке», «К проверочной».
+
+training_reply_keyboard(*, can_level_up, can_level_down=False, admin=False)
+  «Решить ещё»; ряд снижения/повышения; «К проверочной».
+
+settings_reply_keyboard(*, admin=False)
+  Изменить класс/предмет, Подписка, Оставить обращение, Расписание.
+
+exam_reply_keyboard(answers, *, admin=False)
+  По строке на задание: «N · Нет ответа» или «N · ответ отправлен»,
+  затем «Завершить работу», Назад, На главную.
+
+exam_result_reply_keyboard(answers, *, admin=False)
+  «N · верно/неверно/нет ответа».
+
+admin_menu() / admin_content_menu() / cancel_kb()
+  Нижние меню админки. cancel_kb — одна кнопка «Отмена» на шаге мастера.
+
+8.4. Фабрики inline (то, что ещё реально шлётся)
+------------------------------------------------
+subject_keyboard(subjects)  по кнопке на предмет, callback SubjectCB
+grade_keyboard(grades)      «N класс», callback GradeCB
+answer_keyboard(...)        подсказка/разбор/пропуск/жалоба на карточке
+                            задачи. Флаги:
+                              show_help, can_skip, show_hint,
+                              show_report, show_hint_more, show_help_more
+subscription_keyboard(stars_price)
+  Если цена > 0 — кнопка оплаты LearnCB(action="pay")
+admin_pick_keyboard(action, items)
+  Список (id, title) для мастеров админки
+numbered_pick_keyboard(action, items, *, numbers=None)
+  Возвращает (html-каталог, клавиатуру «N · выбрать»)
+admin_users_keyboard(offset, has_next)
+  Пагинация списка учеников
+admin_user_actions(user_id)
+  Выдать 30 дней / Забрать доступ
+
+8.5. Текст и парсеры
+--------------------
+fit_button_text(text, limit=64)
+  Сжимает пробелы, обрезает.
+
+topics_catalog_html(items: list[tuple[number, title, note|None]])
+  HTML-список тем. Номер берётся из БД (sort_order), не из индекса
+  цикла. title экранируется.
+
+learn_status_note(progress_text)
+  None → «ещё не начата»
+  «идёт» → «идёт проверочная»
+  «…» → «начата»
+  иначе «последняя оценка: …»
+
+passed_status_note(grade) → «лучшая оценка: {grade}»
+
+parse_start_from_button(text) → int | None
+  Полное совпадение «Начать с 12».
+
+parse_exam_task_button(text) → int | None
+  «12 · Нет ответа» или «12 · ответ отправлен».
+
+parse_exam_result_button(text) → int | None
+  «12 · верно|неверно|нет ответа».
+  Не пересекается с parse_exam_task_button: другие слова статуса.
+
+exam_task_button_text / exam_result_button_text
+  Собирают подписи рядов экзамена/результата.
+
+
+========================================================================
+ЧАСТЬ 9. НАВИГАЦИЯ И «ВЛАДЕЛЕЦ» КЛАВИАТУРЫ (services/nav.py)
+========================================================================
+
+Идея стека как у мобильного приложения. В FSM data ключ "nav" —
+список экранов. Каждый экран: словарь {s, ..., ids}.
+
+  s     тип: home, learn, progress, settings, theory, training,
+        exam_info, exam_work, exam_result, history, subjects, grades, stub
+  t     id темы, если нужен
+  a     id попытки проверочной
+  i     номер заглушки настроек
+  ids   message_id, которые принадлежат ЭТОМУ экрану (их сотрёт Назад)
+
+HOME_TEXT = "Главное меню. Выберите действие:"
+
+Функции
+-------
+screen_key(screen)
+  Копия без ids. Нужна, чтобы не считать «тот же экран» другим из-за
+  новых сообщений.
+
+get_stack(state) / set_stack(state, screens)
+  Прочитать / записать nav.
+
+reset_stack(state, screen)
+  Стек из одного экрана. Так входят в «Продолжить обучение», «Прогресс»,
+  «Настройки»: Назад с них ведёт домой (длина стека 1).
+
+goto(state, screen)
+  Кладёт экран наверх, если его ключ не совпадает с текущим верхом.
+  Так теория поверх списка тем, проверочная поверх теории.
+
+replace_top(state, screen) → старый верх или None
+  Снять верх и положить новый. Используется, когда «Приступить»
+  превращает exam_info в exam_work: карточка правил больше не нужна
+  в стеке.
+
+pop_screen(state) → снятый экран или None
+  Назад: сначала pop, потом удалить его ids.
+
+track_ui(state, ids)
+  Глобальный список ui_ids — все сообщения бота, которые На главную
+  должна уметь стереть, даже если стек уже потерял ссылку.
+
+attach_ids(state, ids)
+  Дописать ids к текущему верху стека И в ui_ids. Вызывать после
+  каждой отправки «экранного» сообщения.
+
+collect_ui_ids(state)
+  Собирает id из ui_ids, theory_*, ephemeral_*, exam_*, reply_kb_id,
+  всех screen["ids"]. Без дублей. Для полной зачистки.
+
+wipe_ui(bot, chat_id, state, extra=None)
+  Удаляет все собранные id (+ extra, обычно message_id нажатой кнопки)
+  и обнуляет навигационные поля data. Вызывается из «На главную»,
+  /start, входа в обучение/прогресс/настройки.
+
+forget_reply_kb_if_deleted(state, deleted_ids)
+  Если среди удалённых был владелец клавиатуры — reply_kb_id = None.
+  Иначе Telegram Desktop потеряет меню, а бот будет думать, что оно живо.
+
+set_reply_kb_owner(state, message_id)
+  Запомнить, какое сообщение «держит» нижнюю клавиатуру.
+
+adopt_reply_kb(bot, chat_id, state, message_id)
+  Новое сообщение стало владельцем.
+  reply_kb_stub=False (это контент, не фраза «Выбери действие:»).
+  Если СТАРЫЙ владелец был заглушкой (stub) — удалить его, чтобы не
+  копились пустые/короткие сервисные сообщения.
+  Контент (теория, список тем) НЕ удаляется.
+
+apply_reply_keyboard(target, state, markup, *, force=False,
+                     caption="Выбери действие:")
+  Когда клавиатуру надо показать, а прикрутить её к старому сообщению
+  через edit нельзя (edit меняет только inline).
+  Если владелец уже есть и force=False — ничего не делать.
+  Иначе отправить caption с markup, пометить stub=True, старую заглушку
+  удалить.
+  caption никогда не должен быть пустым или невидимым символом:
+  на Desktop пустое сообщение «висит», а клавиатура к нему привязана.
+
+Нюанс Desktop ещё раз: после «Завершить работу» результат сам несёт
+exam_result_reply_keyboard (adopt на это сообщение). apply_reply_keyboard
+после экзамена НЕ вызывается — иначе появилось бы лишнее сообщение.
+
+
+========================================================================
+ЧАСТЬ 10. СООБЩЕНИЯ: УДАЛЕНИЕ И УЧЁТ (services/chat.py)
+========================================================================
+
+track_theory(state, message_id)
+  Список theory_message_ids + последний theory_message_id.
+  Назад по теории сотрёт их.
+
+track_ephemeral(state, message_id, *, control=True)
+  Сообщения текущей задачи (условие, «пока неверно», подсказки).
+  control=True — это «главное» сообщение задачи
+  (current_problem_message_id), его можно edit-ить.
+  control=False — доп. пузыри, только удалять пачкой.
+
+wipe_ephemeral(bot, chat_id, state)
+  Удалить ephemeral, сбросить current_problem_message_id.
+  Перед новой задачей.
+
+wipe_lesson(bot, chat_id, state)
+  Теория + ephemeral, но НЕ exam_panel_ids (панель проверочной нельзя
+  сносить, пока работа идёт).
+
+remember_exam_panel(state, message_id)
+  Ids панели правил проверочной.
+
+delete_quietly(bot, chat_id, ids)
+  Сначала delete_messages пачкой (до 100 id в API). Если нельзя —
+  по одному delete_message. Ошибки глотаются: сообщение уже нет,
+  слишком старое, нет прав.
+
+
+========================================================================
+ЧАСТЬ 11. ДОСТУП, ОТВЕТЫ, ОЦЕНКИ
+========================================================================
+
+11.1. access.py
+---------------
+AccessInfo(allowed, reason, ends_at=None)
+  reason: "admin" | "subscription" | "trial" | "none"
+
+is_admin(user_id, user=None)
+  True, если id в ADMIN_IDS ИЛИ user.role == "admin".
+  Второе — если роль проставили в БД, даже без .env.
+
+check_access(session, user) → AccessInfo
+  Порядок: админ → активная подписка → триал по created_at + TRIAL_DAYS
+  → отказ.
+
+access_label(info) → строка для UI («пробный период до дд.мм.гггг»).
+
+Где проверяется: student._require_student перед обучением/прогрессом.
+Онбординг и /start доступны всегда, чтобы выбрать класс.
+
+11.2. answers.py
+----------------
+check_answer(answer_type, expected, submitted) → bool
+  Типы:
+    number / fraction — Fraction, 3/4 == 0.75 == 0,75
+    numbers           — множество чисел, порядок не важен, разделители
+                        запятая, ;, /, «и», and
+    text / choice     — нижний регистр, ё→е, без лишних пробелов
+  Неразборчивый ввод → False, не исключение наружу.
+
+Внутренние _normalize_text, _parse_number, _parse_number_list
+начинающему трогать незачем; тесты в tests/test_answers.py.
+
+11.3. grades.py — школьная оценка проверочной
+---------------------------------------------
+assessment_size(required, available)
+  Сколько заданий взять: min(required или available, available), хотя бы 1.
+
+pass_minimum(total) = ceil(total * 0.5)  порог «сдано»
+
+grade_bands(total)
+  3 ≈ 50–70%, 4 ≈ 70–90%, 5 ≈ 90–100% с поправками на целые.
+
+score_to_grade(correct, total, *, max_streak=0)
+  Ниже минимума → «не сдано».
+  Все верно И max_streak >= 3 (три максимальных сдачи подряд по теме,
+  считая текущую) → «5+».
+  Иначе 5/4/3 по порогам.
+
+is_passed(grade) — 3 и выше.
+better_grade(current, incoming) — лучшая из двух по GRADE_RANK.
+exam_rules_text(title, total, hours=24) — текст карточки перед работой.
+format_dt(value) — UTC naive → Europe/Moscow dd.mm.yyyy HH:MM.
+
+Оценка попытки пишется в student._complete_attempt: ответы сверяются
+check_answer, считается correct_count, grade, обновляется
+topic_progress.best_grade и флаги theory_done/training_done.
+
+11.4. scoring.py и learning.py
+------------------------------
+Старый контур «сессия assessment внутри Learn.waiting_answer»
+(очередь queue/index). Ученик сейчас ходит в AssessmentAttempt.
+Эти функции ещё нужны для:
+  - apply_reinforcement_result (закрепление)
+  - pick_assessment_queue (случайный набор без повтора прошлого набора)
+  - build_start_queue (до 2 задач закрепления; сейчас start_topic
+    сразу открывает теорию, очередь закрепления не показывается
+    автоматически — функция жива для будущего/старого кода)
+  - apply_assessment_score, если кто-то пройдёт _finish_stage("assessment")
+
+pick_assessment_queue(session, topic, *, avoid_ids=None)
+  Берёт assessment-задачи темы, исключает avoid_ids (прошлый набор),
+  если после исключения мало — игнорирует avoid, random.sample нужного
+  размера, перемешивает.
+
+
+========================================================================
+ЧАСТЬ 12. RICH TEXT (services/richtext.py)
+========================================================================
+
+Теория и условия могут быть HTML с картинками, видео, формулами.
+
+looks_like_html(value) — есть ли теги.
+media_path(raw) — /media/foo.jpg → PROJECT_ROOT/media/foo.jpg.
+html_to_blocks — парсер в список Block(kind, content):
+  text, photo, video, formula.
+_render_formula(tex) — matplotlib, png в media/formulas/, кэш по hash.
+send_rich(target, raw_html, *, header="", reply_markup=None,
+          extra_photo=None) → list[int]
+  Шлёт пачку сообщений. reply_markup вешается ТОЛЬКО на последнее
+  (условие задачи с inline ИЛИ теория с reply-клавиатурой раздела).
+  extra_photo — фото с диска, если kind=photo у редакции теории.
+
+Нельзя передать и inline, и reply на одно сообщение. Поэтому:
+
+  теория: send_rich(..., reply_markup=theory_reply_keyboard(...))
+          последнее сообщение = владелец нижней клавиатуры
+
+  задача: send_rich(..., reply_markup=answer_keyboard(...))
+          нижняя клавиатура живёт на ДРУГОМ сообщении (панель/заглушка/
+          «Верно. Выбери, что дальше:»)
+
+
+========================================================================
+ЧАСТЬ 13. ОБЩИЕ ХЕЛПЕРЫ ХЕНДЛЕРОВ (handlers/common.py)
+========================================================================
+
+TELEGRAM_LIMIT = 3900
+
+split_html(text) → куски по переводам строк, не длиннее лимита.
+
+greeting_name(user)
+  html.escape(first_name или username или «ученик»).
+
+ensure_user(session, tg_user) → User
+  upsert в users. role=admin, если tg_user.id in ADMIN_IDS, иначе student.
+  Вызывать в начале почти каждого пользовательского хендлера: человек
+  мог сменить ник.
+
+access_denied_text() — готовый отказ без доступа.
+
+require_access(session, user) → None | str
+  None если можно заниматься, иначе текст отказа.
+
+safe_callback_answer(callback, text=None, *, show_alert=False)
+  callback.answer, проглатывает «query too old».
+
+
+========================================================================
+ЧАСТЬ 14. СТАРТ И ОНБОРДИНГ (handlers/start.py)
+========================================================================
+
+INTRO — абзац, что делает бот. Показывается в /start.
+
+cmd_start(message, state, session)
+  Фильтр: CommandStart() (это /start).
+  Действия:
+    wipe_ui + state.clear() — чистый лист
+    ensure_user
+    если нет grade или track_id → _ask_subject с приветствием
+    иначе «С возвращением» + menu_for, adopt_reply_kb на это сообщение
+  С этого момента нижняя клавиатура = главное меню.
+
+_ask_subject(message, state, session, *, prefix="")
+  list_subjects. Пусто → «программа не загружена».
+  Иначе состояние Onboarding.subject, inline subject_keyboard,
+  стек сброшен на {s: subjects}.
+  Главное меню сюда НЕ вешается: человек ещё не дома.
+
+onboarding_subject(callback, callback_data: SubjectCB, state, session)
+  Фильтры: SubjectCB + состояние subject.
+  Пишет subject_id в data, состояние grade, шлёт grade_keyboard,
+  goto {s: grades}. callback.answer().
+
+onboarding_grade(callback, callback_data: GradeCB, state, session)
+  Берёт subject_id из data → default_track_for_subject
+  (или математика/школа, если subject_id нет).
+  set_user_grade_and_track.
+  from_settings в data отличает «сменил в настройках» от первого входа.
+  wipe_ui + state.clear(), сообщение с menu_for — снова дом.
+
+cmd_class — Command("class"): from_settings=True и _ask_subject.
+  Дубль кнопки «Изменить класс/предмет».
+
+cmd_cancel — Command("cancel"): state.clear(), «действие сброшено»,
+  menu_for. Стек экранов при этом не чистит UI-сообщения; /start чище.
+
+
+========================================================================
+ЧАСТЬ 15. ГЛАВНОЕ МЕНЮ И УЧЕНИК (handlers/student.py)
+========================================================================
+
+Это самый большой файл. Ниже — поток и функции.
+
+15.1. Константы
+---------------
+STUBS = {1: подписка, 2: обращение, 3: расписание} — тексты «скоро».
+RESULT_LIMIT = 3900 — обрезка раскрытого результата.
+
+15.2. Показ экрана
+------------------
+_present(target, state, text, markup=None, *, edit=False, user_id=None)
+  Единая отправка «экрана».
+  edit=True: правит текст; inline можно передать, reply через edit
+             не ставится (ограничение API).
+  markup InlineKeyboardMarkup: отправить с inline, НЕ менять владельца
+             нижней клавиатуры (пример: выбор предмета из настроек —
+             снизу остаются Назад/Настройки).
+  markup ReplyKeyboardMarkup или None: None → section_for (Назад/Домой).
+             Сообщение становится владельцем клавиатуры через adopt.
+
+_safe_edit(target, text, markup)
+  edit_text, при неудаче — новое send_message.
+
+15.3. Клавиатуры разделов при «Назад»
+-------------------------------------
+_section_kb_for(state, user_id, screen)
+  По screen["s"] собирает правильную нижнюю клавиатуру.
+  exam_work → None (панель экзамена сама держит клавиатуру).
+  exam_result → простой section_for, если нужно восстановить после
+  вложенного экрана.
+
+_restore_section_reply(target, state, user_id, screen, *, force=False)
+  Если kb не None — apply_reply_keyboard с человеческой подписью
+  («Теория. Выбери действие:» и т.д.). force=True, когда предыдущий
+  владелец удалён (ушли с экзамена, стёрли теорию).
+
+15.4. Вход с главного меню
+--------------------------
+btn_learn  — текст BTN_CONTINUE или Command("learn")
+btn_progress — BTN_PROGRESS / /progress
+btn_settings — BTN_SETTINGS / /settings
+
+Общий рисунок: wipe_ui (включая нажатую кнопку), проверка
+_require_student (класс выбран? доступ есть?), затем
+show_learn_list / show_progress_list / show_settings.
+
+_require_student(session, tg_user, target) → (user, error)
+  error: None | "choose" | "denied"
+  denied уже отправил текст отказа с menu_for.
+
+show_learn_list(...)
+  reset_stack {s: learn}, состояние pick_topic.
+  Темы класса, у которых best_grade ещё не 3+.
+  Каталог HTML + learn_reply_keyboard(минимальный sort_order).
+  В data: start_topic_id, start_number, pick_source="learn".
+
+show_progress_list(...)
+  Только сданные. Просят написать номер или «и1».
+  Клавиатура: section (Назад/Домой), без «Начать с».
+
+show_settings(...)
+  settings_reply_keyboard.
+
+15.5. Выбор темы
+----------------
+start_from_button — regexp «Начать с N» в состоянии pick_topic.
+  Берёт start_topic_id из data (рекомендованная первая несданная),
+  иначе тему по номеру. Удаляет пузырь нажатия. _open_theory.
+
+pick_topic_by_number — любая цифра или «и12» / «история 12».
+  «иN» → _show_history (список попыток текстом).
+  число → _open_theory.
+
+_open_theory(target, state, session, user, topic_id)
+  Если верх стека уже theory — заменить (переход с темы на тему),
+  иначе goto theory. Дальше learn.show_topic_theory.
+
+15.6. Назад и домой
+-------------------
+_navigate_home(target, state, user_id)
+  wipe_ui, state None, сообщение HOME_TEXT + menu_for, стек {s: home}.
+
+_navigate_back(...)
+  Если состояние exam_answer и открыт вопрос — только закрыть вопрос,
+  остаться в exam_work (клавиатура экзамена жива).
+  Если стек длины 1 — домой.
+  Иначе pop, _discard_screen (удалить ids текущего), восстановить
+  состояние предыдущего через _apply_screen_state.
+  force_menu, если reply_kb_id стал None (владельца стёрли).
+
+_discard_screen(...)
+  exam_work: стереть вопрос и панель, очистить panel_message_id в БД.
+  training/theory: стереть ephemeral/theory ids.
+
+_apply_screen_state(...)
+  Выставляет FSM (pick_topic / waiting_answer / exam_work / ...)
+  и просит _restore_section_reply.
+
+Хендлеры: home_text / back_text (reply-кнопки) и go_home / go_back
+(старые inline MenuCB hm/bk).
+
+15.7. Проверочная
+-----------------
+_show_exam_info
+  Если уже in_progress — сразу _show_exam_work.
+  Если есть завершённая/просроченная активная — показать результат
+  (редкий край).
+  Иначе карточка правил + «Приступить», стек exam_info, topic_id в data.
+
+_begin_exam
+  Создать AssessmentAttempt: случайная очередь, deadline now+ASSESSMENT_HOURS,
+  строки AssessmentAnswer. replace_top на exam_work, удалить ids карточки
+  правил, показать панель.
+
+_show_exam_work
+  Текст правил + сроки + «выбери задание внизу».
+  reply_markup = exam_reply_keyboard.
+  Это сообщение — панель и владелец клавиатуры. Его id пишется в
+  attempt.panel_message_id и exam_panel_ids.
+  Состояние exam_work.
+
+exam_pick_task — regexp статуса задания.
+  parse_exam_task_button → _open_exam_question.
+
+_open_exam_question
+  Если попытка истекла — _complete через _maybe_expire и показать
+  результат.
+  Иначе стереть предыдущий вопрос, состояние exam_answer, send_rich
+  условия БЕЗ нижней клавиатуры (панель жива). ids в exam_question_ids.
+
+exam_answer — текст в exam_answer, не команда, не NAV_BUTTONS,
+  не кнопка задания.
+  save_attempt_answer (ещё НЕ сверяет с эталоном для оценки —
+  сверка в _complete_attempt).
+  Удаляет пузырь ответа и вопрос, шлёт «Ответ сохранён.» с обновлённой
+  клавиатурой (статусы кнопок), состояние снова exam_work.
+
+_finish_exam_attempt / exam_finish_text / callback fi
+  _complete_attempt: is_correct по каждому ответу, grade, best_grade.
+  Стереть вопрос и панель, pop exam_work, _render_result с
+  exam_result_reply_keyboard на самом результате. Без пустого сообщения.
+
+_render_result(..., edit, expanded=0, wipe_panel=False, state=...)
+  Текст итога. expanded — номер раскрытого задания (условие + твой
+  ответ + правильное решение).
+  edit=True правит result_message_id, клавиатуру не трогает.
+  Первый показ: _present с reply-клавиатурой результата, в data
+  result_attempt_id и result_message_id.
+
+exam_result_pick — regexp «N · верно|...».
+  Переключает раскрытие, как аккордеон.
+
+_maybe_expire(session, attempt, now)
+  Если in_progress и now >= deadline_at — _complete_attempt status=expired.
+
+15.8. Настройки
+---------------
+settings_class_text / callback sc → _open_class_picker
+  goto subjects, Onboarding.subject, from_settings=True, inline предметы.
+  Нижняя клавиатура настроек остаётся (inline не adopt).
+
+settings_stub_text / callback sb → тексты STUBS, экран stub.
+
+15.9. История
+-------------
+_show_history — нумерованный список попыток текстом, без кнопок на
+каждую попытку. Вернуться: Назад.
+
+
+========================================================================
+ЧАСТЬ 16. ТЕОРИЯ И ТРЕНИРОВКА (handlers/learn.py)
+========================================================================
+
+16.1. Вход в тему
+-----------------
+show_topic_theory(message, state, session, user, topic)
+  wipe_lesson, set_current_topic, progress.theory_done=True,
+  mastery хотя бы learning, LearningSession kind=theory,
+  состояние waiting_answer, data: session_id, topic_id, stage=theory.
+  _send_theory.
+
+_send_theory_edition(..., item)
+  send_rich тела редакции + theory_reply_keyboard(can_more=есть ещё
+  edition). Последний id → adopt_reply_kb.
+
+«Всё ещё непонятно» → _advance_theory: следующая TopicTheory.edition.
+
+«К тренировке» → _start_training:
+  уровни difficulty из БД, goto training, apply_reply_keyboard
+  тренировки (force), первая задача.
+
+«К проверочной» → student._show_exam_info.
+
+16.2. Задача тренировки
+-----------------------
+_present_problem
+  wipe_ephemeral, send_rich условия с answer_keyboard
+  (подсказка если есть, пропуск только на training).
+  Не трогает нижнюю клавиатуру.
+  data: current_problem_id, attempt_count=0, used_help=False,
+  hint_edition=0, solution_edition=0, used_problem_ids.
+
+_send_training_problem(..., difficulty, user_id, exclude_current=True,
+                      exclude_session_used=True)
+  repos.pick_training_problem с кулдауном TRAINING_REPEAT_DAYS.
+  False, если задач нет.
+
+handle_answer — waiting_answer, текст не / и не NAV_BUTTONS.
+  check_answer. Пишет Attempt и UserProblemStat.
+  Верно на training: снимает inline с карточки, шлёт
+  «Верно. Выбери, что дальше:» с training_reply_keyboard
+  (это новый владелец, заглушка «Тренировка...» удалится как stub).
+  Неверно: «Пока неверно», после WRONG_ATTEMPTS_BEFORE_HELP
+  на клавиатуре задачи появляется разбор; сразу появляется жалоба.
+
+show_hint / show_help
+  Следующая редакция hint/solution отдельным сообщением.
+  Первый help пишет Attempt submitted="[help]" used_help=True —
+  это влияет на старый scoring, на школьную оценку проверочной нет.
+
+skip_problem — только stage=training, Attempt "[skip]", следующая задача.
+
+report_problem — problems.needs_review=True, админ видит в «Жалобах».
+
+Решить ещё / уровни — _train_more / _train_change_level.
+  Смена уровня сбрасывает used_problem_ids и force-обновляет нижнюю
+  клавиатуру (набор кнопок уровней мог измениться).
+
+
+========================================================================
+ЧАСТЬ 17. ПОДПИСКА (handlers/subscription.py)
+========================================================================
+
+send_subscription_card(message, session, user)
+  Текст статуса + либо кнопка Stars, либо «напиши репетитору».
+  Сейчас из настроек ведёт в заглушку STUBS[1], не в эту карточку.
+  Карточка жива для /subscribe-подобных вызовов и админских подсказок.
+  (Отдельного Command("subscribe") в коде нет — только эта функция
+  и inline pay.)
+
+cmd_grant — только ADMIN_IDS. Формат:
+  /grant telegram_id_или_@username дни
+  Если id числом и пользователя нет — upsert_user «зарезервирует» строку.
+  Иначе человек должен сначала нажать /start.
+  grant_subscription source="admin", уведомление ученику.
+
+cmd_revoke /grant зеркально, cmd_stats — count_users.
+
+pay_stars — LearnCB pay, answer_invoice currency="XTR" (Stars).
+  amount=STARS_PRICE, не умножать на 100: у Stars нет копеек.
+
+pre_checkout — всегда ok=True. Без этого Telegram не проведёт оплату.
+
+successful_payment — grant 30 дней source="stars", payment_id из чека.
+
+
+========================================================================
+ЧАСТЬ 18. АДМИНКА (handlers/admin.py)
+========================================================================
+
+AdminOnly — BaseFilter: is_admin(from_user.id).
+Навесь на router.message и router.callback_query: не-админ сюда не попадёт.
+Команды /grant живут в subscription.py и проверяют ADMIN_IDS сами,
+потому что тот роутер общий.
+
+open_admin — BTN_ADMIN или /admin → admin_menu().
+admin_back — BTN_ADMIN_BACK → menu_for, выход в ученика.
+admin_cancel — BTN_CANCEL → сброс мастера, снова админ-меню.
+
+Контент (admin_content_menu):
+  Предмет → состояние subject_title → create_subject.
+  Класс → grade_number → add_grade.
+  Тема → цепочка: предмет (inline) → класс → title → summary →
+         theory (текст или фото в media/uploads) → сколько заданий в
+         проверочной → опционально номер → create_topic + allocate_topic_number.
+         «-» на шаге теории/подсказки значит «пропустить».
+  Задача → предмет → класс → тема → kind (training/assessment/...) →
+         difficulty 1..3 → prompt → answer (_guess_answer_type) → hint →
+         create_problem.
+  Ещё редакция теории / подсказка / разбор — дописать edition.
+
+Ученики: страницы по 6, карточка, grant 30 дней, revoke.
+Выдать доступ: переслать сообщение ученика или написать id/@username,
+затем число дней.
+
+Жалобы: list_flagged_problems, кнопка снять флаг.
+
+_guess_answer_type(answer)
+  есть «;» или « и » → numbers
+  есть «/» → fraction
+  чистое число → number
+  иначе text
+
+
+========================================================================
+ЧАСТЬ 19. РЕПОЗИТОРИЙ (db/repos.py) — ЧТО ВЫЗЫВАТЬ
+========================================================================
+
+Хендлер не должен писать SQL. Ниже — смысл функций. session всегда
+первый аргумент AsyncSession.
+
+Пользователи
+  upsert_user(session, user_id, username, first_name, last_name, *, role="student")
+  get_user, list_users_page(offset, limit), count_users, list_user_ids
+  get_user_by_username, find_user(raw) — id или @nick
+  set_user_grade_and_track(session, user_id, grade, track_id)
+  set_current_topic(session, user_id, topic_id)
+
+Подписка
+  get_active_subscription(session, user_id, now)
+  grant_subscription(session, user_id, days, source, now, payment_id=None)
+    Продлевает, если активная ещё не кончилась: ends_at = max(now, old)+days.
+  revoke_subscriptions(session, user_id) — status=revoked у активных.
+
+Предметы, треки, классы
+  list_subjects, create_subject(title) — slug из транслита/упрощения
+  list_grades, add_grade
+  get_subject_by_slug, get_track_by_slug, get_math_school_track
+  default_track_for_subject — slug school или первый трек
+
+Темы
+  list_topics_for_grade(track_id, grade)
+  get_topic, get_topic_by_number(track_id, grade, number) — по sort_order
+  allocate_topic_number / create_topic — сдвиг номеров, см. topics.py
+  list_topic_theories, add_topic_theory, upsert_topic_theory,
+  refresh_topic_theory_counts
+
+Задачи
+  list_problems(topic_id, kind=None)
+  list_topic_problems, get_problem, get_problems_by_ids
+  list_difficulties(topic_id, kind)
+  pick_random_problem / pick_training_problem(..., exclude_ids, cooldown_days)
+  next_problem_sort, create_problem
+  flag_problem / clear_problem_flag / list_flagged_problems
+  list_hint_bodies / list_solution_bodies — строки для UI
+  add_problem_hint / add_problem_solution / upsert_*
+
+Прогресс и сессии (тренировка)
+  get_or_create_progress, list_progress_with_topics
+  create_session, get_active_session, finish_session, set_session_stage
+  add_attempt, list_session_attempts
+  touch_problem_stat — last_solved_at для кулдауна
+  list_reinforcement_for_user
+
+Проверочная
+  parse_id_list / join_id_list — problem_ids хранятся строкой "1,2,3"
+  get_active_attempt(user_id, topic_id) — in_progress
+  get_attempt, list_topic_attempts, list_attempts_for_topics
+  create_assessment_attempt(..., problem_ids, started_at, deadline_at)
+    создаёт и строки ответов sort_order=1..n
+  get_attempt_answers, save_attempt_answer(attempt_id, problem_id, text)
+  finish_attempt(..., correct_count, grade, status)
+  count_max_scores — для правила 5+
+
+
+========================================================================
+ЧАСТЬ 20. БАЗА: МОДЕЛИ, МИГРАЦИИ, СИД
+========================================================================
+
+models.py — таблицы. PK пользователя = Telegram id (BigInteger).
+Даты naive UTC. Bool в MySQL = TINYINT(1).
+
+Виды задач Problem.kind: training | assessment | reinforcement.
+Типы ответов: number, fraction, numbers, text, choice.
+
+migrate.apply_schema(sync_conn)
+  create_all, затем точечные ALTER из словарей _TOPIC_COLUMNS и т.д.
+  Бэкфилл: старая колонка topics.theory → первая TopicTheory;
+  hints/solutions → первые редакции.
+  Перенумерация sort_order тем, если дырки.
+
+Почему не Alembic: проект маленький, колонки добавляют редко, и их
+явно перечисляют. Новый столбец = модель + migrate + db_descr.txt
+(правило .cursor/rules/db-descr.mdc).
+
+seed_curriculum
+  Гарантирует grades 6–9, subject math, track school, темы из
+  MATH_SCHOOL_TOPICS. Повторный запуск обновляет тексты, задачи
+  темы пересобирает (_replace_problems). Ручные темы админки с
+  другими slug не затираются.
+
+
+========================================================================
+ЧАСТЬ 21. ДАННЫЕ В FSM data — ШПАРГАЛКА КЛЮЧЕЙ
+========================================================================
+
+Навигация
+  nav                  стек экранов
+  ui_ids               все id для На главную
+  reply_kb_id          владелец нижней клавиатуры
+  reply_kb_stub        True, если владелец — короткая «Выбери действие:»
+
+Онбординг / настройки
+  subject_id
+  from_settings        True, если класс меняют не в первый раз
+
+Обучение
+  pick_source          "learn" | "progress"
+  start_topic_id, start_number
+  topic_id, stage      "theory" | "training" | "reinforcement" | "assessment"
+  session_id           LearningSession.id
+  theory_edition, theory_message_id, theory_message_ids
+  queue, index         старый конвейер задач (закрепление/assessment)
+  current_problem_id, current_problem_message_id
+  current_difficulty, can_level_up, can_level_down
+  attempt_count, used_help, hint_used, hint_edition, solution_edition
+  used_problem_ids, problem_base_text
+  ephemeral_ids
+
+Проверочная
+  exam_attempt_id, exam_topic_id, exam_problem_id, exam_sort
+  exam_question_ids, exam_panel_ids
+  result_attempt_id, result_message_id, result_expanded
+
+
+========================================================================
+ЧАСТЬ 22. ПОРЯДОК ХЕНДЛЕРОВ НА ОДИН АПДЕЙТ (ПРАКТИКА)
+========================================================================
+
+Пример: ученик в тренировке нажимает «На главную».
+
+  1. Telegram шлёт message.text = "На главную"
+  2. TypingMiddleware включает «печатает»
+  3. DbSessionMiddleware открывает session
+  4. start.router — нет CommandStart и т.п.
+  5. subscription.router — нет
+  6. student.router: home_text (F.text == BTN_HOME) СРАБАТЫВАЕТ
+     learn.handle_answer даже не смотрит: апдейт уже обработан
+  7. wipe_ui, главное меню
+  8. commit
+
+Пример: ученик пишет «3/4» как ответ.
+
+  student: не Назад/не экзамен/не номер темы
+  learn: handle_answer, состояние waiting_answer, текст не в NAV_BUTTONS
+  check_answer → верно/неверно
+
+Пример: нажата inline «Подсказка».
+
+  Это callback_query, не message.
+  learn.show_hint, LearnCB action=hint, состояние waiting_answer.
+  callback.answer() обязателен.
+
+
+========================================================================
+ЧАСТЬ 23. ТОНКОСТИ И ЛОВУШКИ
+========================================================================
+
+1. Один процесс на один BOT_TOKEN при polling. Второй экземпляр
+   украдёт апдейты. Несколько воркеров — только webhook + Redis.
+
+2. commit после хендлера. Если нужно гарантировать запись ДО
+   внешней отправки (invoice), полагайся на то, что падение после
+   commit не откатится — сейчас commit в конце. Критичные вещи
+   (оплата) пишутся в том же хендлере до answer.
+
+3. Не клади ORM-объекты в FSM: сессия закроется.
+
+4. callback.answer() всегда. Иначе вечная загрузка кнопки.
+
+5. edit_message_text не меняет reply keyboard. Только inline.
+   Смена нижней клавиатуры = новое сообщение с reply_markup.
+
+6. Удаление владельца клавиатуры на Desktop = исчезновение меню.
+   Сначала новое сообщение с клавиатурой, потом удалять старое,
+   и то только если это stub.
+
+7. Никогда не слать сообщение из одного пробела / U+2063 «чтобы
+   прикрепить клавиатуру». Это и есть баг пустого пузыря после
+   проверочной, который уже закрыт.
+
+8. Личка: chat.id == user.id. В группах этот бот не рассчитан
+   (клавиатуры, wipe, ensure_user).
+
+9. HTML parse mode: сырой «1 < 2» сломает сообщение. escape.
+
+10. Оценка проверочной не живая: пока не нажали «Завершить» или
+    не вышел срок, is_correct в строках ответа может быть пустым.
+    Кнопки показывают только «отправлен / нет».
+
+11. 5+ требует три максимальных результата подряд (count_max_scores).
+    Это не «три любые пятёрки за жизнь».
+
+12. Случайный набор проверочной: при новой попытке старается не
+    повторить problem_ids предыдущей. Банк должен быть больше
+    assessment_required, иначе повтор неизбежен.
+
+13. Сид перезаписывает задачи тем из math_school.py. Админские темы
+    с другим slug в безопасности. Правки «тех же» slug через админку
+    могут откатиться при рестарте бота.
+
+14. MemoryStorage + рестарт бота = ученик «выпал» из состояния,
+    но сообщения в чате остались. /start лечит.
+
+15. NAV_BUTTONS нужно пополнять при новой нижней кнопке, иначе
+    handle_answer примет её за решение.
+
+16. Порядок роутеров — часть контракта. Новый хендлер «любой текст»
+    на student.router перехватит ответы тренировки, если его
+    поставить без фильтров состояния.
+
+17. Тесты не ходят в Telegram. Они проверяют клавиатуры, дроби,
+    пороги оценок. Живой UX проверяй руками в Desktop и на телефоне:
+    клавиатуры ведут себя по-разному.
+
+18. notify_admins шлёт «Бот запущен» каждому из ADMIN_IDS. Если id
+    неверный или человек не нажал /start боту — Telegram ответит
+    ошибкой, она глотается.
+
+
+========================================================================
+ЧАСТЬ 24. КАК ДОБАВИТЬ НОВУЮ КНОПКУ РАЗДЕЛА (РЕЦЕПТ)
+========================================================================
+
+  1. Константа BTN_FOO в keyboards.py и в NAV_BUTTONS.
+  2. Добавить ряд в нужную фабрику (theory_reply_keyboard и т.д.).
+  3. Хендлер @router.message(F.text == BTN_FOO) на правильном роутере
+     и в правильном состоянии.
+  4. Удалять message_id нажатия через delete_quietly, если это не дом.
+  5. Если экран новый — nav.goto + attach_ids + adopt, если несёт
+     нижнюю клавиатуру.
+  6. Тест в tests/test_keyboards.py: кнопка есть, Назад/Домой на месте,
+     главных трёх кнопок нет.
+  7. Если трогали схему БД — db_descr.txt в том же изменении.
+
+
+========================================================================
+ЧАСТЬ 25. ТЕСТЫ
+========================================================================
+
+tests/test_answers.py     check_answer, нормализация дробей и списков
+tests/test_grades.py      пороги 3/4/5/5+, pass_minimum
+tests/test_keyboards.py   каталог HTML, парсеры кнопок, состав меню
+tests/test_topics.py      plan_topic_insert / нумерация
+
+Запуск из корня, интерпретатор проекта, на Windows часто нужны права
+вне песочницы (иначе venv не стартует):
+
+  .venv\Scripts\python.exe -m pytest tests -q
+
+
+========================================================================
+ЧАСТЬ 26. СЛОВАРЬ ТЕРМИНОВ
+========================================================================
+
+Апдейт        пакет «событие» от Telegram
+Хендлер       async-функция, которую aiogram вызывает на апдейт
+Роутер        набор хендлеров с общим фильтром
+FSM           память «на каком шаге диалога человек»
+Reply keyboard  кнопки внизу экрана, шлют текст
+Inline keyboard кнопки под сообщением, шлют callback_query
+Callback data короткая строка на inline-кнопке
+Polling       бот сам спрашивает getUpdates
+Webhook       Telegram сам POST-ит на URL
+Сессия БД     AsyncSession на один апдейт
+Сид           заливка стартового контента
+Стек nav      история экранов для Назад
+Владелец KB   сообщение, к которому Desktop привязал нижнее меню
+Триал         бесплатные TRIAL_DAYS после первого /start
+Трек          школьная программа / ОГЭ / ЕГЭ внутри предмета
+Mastery       старый текстовый уровень темы по проценту
+best_grade    школьная оценка 3/4/5/5+ по проверочным
+
+
+Конец руководства. Если поведение в чате расходится с текстом —
+верь коду: хендлеры в tutor_bot/handlers и клавиатуры в keyboards.py.
+Схему таблиц сверяй с db_descr.txt.

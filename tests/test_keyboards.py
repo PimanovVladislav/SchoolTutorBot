@@ -1,8 +1,27 @@
+from types import SimpleNamespace
+
 from tutor_bot.keyboards import (
+    BTN_BACK,
+    BTN_CONTINUE,
+    BTN_EXAM_START,
+    BTN_HOME,
+    BTN_PROGRESS,
+    BTN_SETTINGS,
+    exam_reply_keyboard,
+    exam_result_reply_keyboard,
+    exam_start_reply_keyboard,
     fit_button_text,
+    learn_reply_keyboard,
     learn_status_note,
+    main_menu,
+    parse_exam_result_button,
     parse_exam_task_button,
+    parse_start_from_button,
+    section_keyboard,
+    settings_reply_keyboard,
+    theory_reply_keyboard,
     topics_catalog_html,
+    training_reply_keyboard,
 )
 
 
@@ -41,52 +60,60 @@ def test_parse_exam_task_button():
     assert parse_exam_task_button("3") is None
 
 
-def _inline_texts(markup) -> list[str]:
-    return [button.text for row in markup.inline_keyboard for button in row]
+def test_parse_start_from_button():
+    assert parse_start_from_button("Начать с 3") == 3
+    assert parse_start_from_button("Назад") is None
 
 
-def test_reply_menu_has_back_and_home():
-    from tutor_bot.keyboards import BTN_BACK, BTN_HOME, exam_reply_keyboard, main_menu
+def test_parse_exam_result_button():
+    assert parse_exam_result_button("1 · верно") == 1
+    assert parse_exam_result_button("2 · неверно") == 2
+    assert parse_exam_result_button("3 · нет ответа") == 3
+    assert parse_exam_result_button("1 · Нет ответа") is None
 
-    texts = [button.text for row in main_menu().keyboard for button in row]
+
+def _reply_texts(markup) -> list[str]:
+    return [button.text for row in markup.keyboard for button in row]
+
+
+def test_main_menu_has_home_actions_only():
+    texts = _reply_texts(main_menu())
+    assert texts == [BTN_CONTINUE, BTN_PROGRESS, BTN_SETTINGS]
+    assert BTN_BACK not in texts
+    assert BTN_HOME not in texts
+
+
+def test_section_keyboard_has_back_and_home():
+    texts = _reply_texts(section_keyboard([[BTN_EXAM_START]]))
+    assert BTN_EXAM_START in texts
     assert BTN_BACK in texts
     assert BTN_HOME in texts
+    assert BTN_CONTINUE not in texts
+
+
+def test_exam_reply_has_nav():
     answers = [
-        type("Row", (), {"sort_order": 1, "submitted": None})(),
+        SimpleNamespace(sort_order=1, submitted=None),
     ]
-    exam_texts = [
-        button.text
-        for row in exam_reply_keyboard(answers).keyboard
-        for button in row
-    ]
-    assert BTN_BACK in exam_texts
-    assert BTN_HOME in exam_texts
+    texts = _reply_texts(exam_reply_keyboard(answers))
+    assert BTN_BACK in texts
+    assert BTN_HOME in texts
 
 
-def test_inline_screens_have_no_back_home():
-    from types import SimpleNamespace
-
-    from tutor_bot.keyboards import (
-        BTN_BACK,
-        BTN_HOME,
-        exam_result_keyboard,
-        exam_start_keyboard,
-        learn_start_keyboard,
-        settings_keyboard,
-        theory_keyboard,
-    )
-
+def test_section_screens_use_reply_actions():
     answers = [
         SimpleNamespace(sort_order=1, is_correct=True, submitted="1"),
     ]
     markups = [
-        theory_keyboard(),
-        learn_start_keyboard(1, 1),
-        exam_start_keyboard(1),
-        settings_keyboard(),
-        exam_result_keyboard(1, answers),
+        learn_reply_keyboard(2),
+        exam_start_reply_keyboard(),
+        settings_reply_keyboard(),
+        theory_reply_keyboard(),
+        training_reply_keyboard(can_level_up=True, can_level_down=True),
+        exam_result_reply_keyboard(answers),
     ]
     for markup in markups:
-        texts = _inline_texts(markup)
-        assert BTN_BACK not in texts
-        assert BTN_HOME not in texts
+        texts = _reply_texts(markup)
+        assert BTN_BACK in texts
+        assert BTN_HOME in texts
+        assert BTN_CONTINUE not in texts

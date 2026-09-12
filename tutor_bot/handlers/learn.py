@@ -10,16 +10,22 @@ from tutor_bot.config import TRAINING_REPEAT_DAYS, WRONG_ATTEMPTS_BEFORE_HELP
 from tutor_bot.db import repos
 from tutor_bot.db.models import Problem, Topic, User
 from tutor_bot.keyboards import (
+    BTN_LEVEL_DOWN,
+    BTN_LEVEL_UP,
+    BTN_THEORY_MORE,
+    BTN_TO_EXAM,
+    BTN_TO_TRAINING,
+    BTN_TRAIN_MORE,
     DIFFICULTY_LABELS,
     LearnCB,
     TopicCB,
-    after_correct_training_keyboard,
     answer_keyboard,
     menu_for,
-    theory_keyboard,
+    theory_reply_keyboard,
+    training_reply_keyboard,
     NAV_BUTTONS,
 )
-from tutor_bot.services.answers import check_answer
+from tutor_bot.services.access import is_admin
 from tutor_bot.services.chat import (
     delete_quietly,
     track_ephemeral,
@@ -135,7 +141,10 @@ async def _send_theory_edition(
     topic: Topic,
     item,
 ) -> None:
-    markup = theory_keyboard(has_more=_has_more_edition(item))
+    markup = theory_reply_keyboard(
+        can_more=_has_more_edition(item),
+        admin=is_admin(target.chat.id),
+    )
     header = f"<b>{topic.title}</b>"
     total = int(item.edition_count or 1)
     if total > 1:
@@ -154,7 +163,8 @@ async def _send_theory_edition(
     for message_id in ids:
         await track_theory(state, message_id)
     await nav.attach_ids(state, ids)
-    await nav.apply_reply_keyboard(target, menu_for(target.chat.id))
+    if ids:
+        await nav.adopt_reply_kb(target.bot, target.chat.id, state, ids[-1])
 
 
 async def _send_theory(
@@ -214,7 +224,6 @@ async def _present_problem(
     for message_id in ids:
         await track_ephemeral(state, message_id)
     await nav.attach_ids(state, ids)
-    await nav.apply_reply_keyboard(target, menu_for(target.chat.id))
     used = list((await state.get_data()).get("used_problem_ids") or [])
     if problem.id not in used:
         used.append(problem.id)
@@ -403,6 +412,161 @@ async def _refresh_problem_keyboard(target: Message, state: FSMContext, markup) 
         pass
 
 
+async def _advance_theory(target: Message, state: FSMContext, session: AsyncSession) -> str | None:
+    data = await state.get_data()
+    if data.get("stage") != "theory":
+        return None
+    topic = await repos.get_topic(session, data.get("topic_id") or 0)
+    if topic is None:
+        return "Тема не найдена"
+    theories = await _topic_theories(session, topic)
+    nxt = int(data.get("theory_edition") or 1) + 1
+    item = next((row for row in theories if int(row.edition) == nxt), None)
+    if item is None:
+        return "Других объяснений нет"
+    await _clear_theory_markup(target.bot, target.chat.id, state)
+    await _send_theory_edition(target, state, topic, item)
+    await state.update_data(theory_edition=int(item.edition))
+    return None
+
+
+async def _apply_training_keyboard(
+    target: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    user_id: int,
+    difficulty: int | None = None,
+    *,
+    force: bool = False,
+) -> None:
+    data = await state.get_data()
+    topic_id = data.get("topic_id")
+    current = int(difficulty or data.get("current_difficulty") or 1)
+    nxt = await _next_difficulty(session, topic_id, current)
+    prev = await _prev_difficulty(session, topic_id, current)
+    await state.update_data(
+        can_level_up=nxt is not None, can_level_down=prev is not None
+    )
+    await nav.apply_reply_keyboard(
+        target,
+        state,
+        training_reply_keyboard(
+            can_level_up=nxt is not None,
+            can_level_down=prev is not None,
+            admin=is_admin(user_id),
+        ),
+        force=force,
+        caption="Тренировка. Выбери действие:",
+    )
+
+
+async def _start_training(
+    target: Message, state: FSMContext, session: AsyncSession, user_id: int
+) -> str | None:
+    data = await state.get_data()
+    topic_id = data.get("topic_id")
+    if not topic_id:
+        return "Сначала выбери тему"
+    levels = await repos.list_difficulties(session, topic_id, "training")
+    if not levels:
+        return "В теме нет тренировочных задач"
+    if not data.get("session_id"):
+        learning = await repos.create_session(
+            session, user_id, int(topic_id), "training"
+        )
+        await state.update_data(session_id=learning.id)
+        data = await state.get_data()
+    await repos.set_session_stage(session, data["session_id"], "training")
+    await nav.goto(state, {"s": "training", "t": int(topic_id)})
+    await state.update_data(
+        stage="training",
+        queue=[],
+        index=0,
+        used_problem_ids=[],
+        current_difficulty=levels[0],
+    )
+    await _apply_training_keyboard(
+        target, state, session, user_id, levels[0], force=True
+    )
+    ok = await _send_training_problem(
+        target,
+        state,
+        session,
+        difficulty=levels[0],
+        user_id=user_id,
+        exclude_current=False,
+    )
+    if not ok:
+        return "Не удалось выбрать задачу"
+    return None
+
+
+async def _open_assessment(
+    target: Message, state: FSMContext, session: AsyncSession, user
+) -> str | None:
+    data = await state.get_data()
+    topic_id = data.get("topic_id")
+    if not topic_id:
+        return "Сначала выбери тему"
+    topic = await repos.get_topic(session, topic_id)
+    if topic is None:
+        return "Тема не найдена"
+    from tutor_bot.handlers.student import _show_exam_info
+
+    await _show_exam_info(target, state, session, user, topic.id, edit=False)
+    return None
+
+
+async def _train_more(
+    target: Message, state: FSMContext, session: AsyncSession, user_id: int
+) -> str | None:
+    data = await state.get_data()
+    if data.get("stage") != "training":
+        return None
+    difficulty = int(data.get("current_difficulty") or 1)
+    ok = await _send_training_problem(
+        target, state, session, difficulty=difficulty, user_id=user_id
+    )
+    if not ok:
+        return "Задач этого уровня пока нет"
+    return None
+
+
+async def _train_change_level(
+    target: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    user_id: int,
+    *,
+    up: bool,
+) -> str | None:
+    data = await state.get_data()
+    if data.get("stage") != "training":
+        return None
+    topic_id = data.get("topic_id")
+    current = int(data.get("current_difficulty") or 1)
+    nxt = (
+        await _next_difficulty(session, topic_id, current)
+        if up
+        else await _prev_difficulty(session, topic_id, current)
+    )
+    if nxt is None:
+        return "Это максимальный уровень" if up else "Это минимальный уровень"
+    await state.update_data(current_difficulty=nxt, used_problem_ids=[])
+    await _apply_training_keyboard(target, state, session, user_id, nxt, force=True)
+    ok = await _send_training_problem(
+        target,
+        state,
+        session,
+        difficulty=nxt,
+        user_id=user_id,
+        exclude_current=False,
+    )
+    if not ok:
+        return "На следующем уровне нет задач" if up else "На предыдущем уровне нет задач"
+    return None
+
+
 @router.callback_query(TopicCB.filter(F.action == "open"))
 async def open_topic(
     callback: CallbackQuery,
@@ -430,157 +594,142 @@ async def open_topic(
 async def theory_more(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
 ) -> None:
-    data = await state.get_data()
-    topic = await repos.get_topic(session, data.get("topic_id") or 0)
-    if topic is None:
-        await callback.answer("Тема не найдена", show_alert=True)
+    fail = await _advance_theory(callback.message, state, session)
+    if fail:
+        await callback.answer(fail, show_alert=True)
         return
-    theories = await _topic_theories(session, topic)
-    nxt = int(data.get("theory_edition") or 1) + 1
-    item = next((row for row in theories if int(row.edition) == nxt), None)
-    if item is None:
-        await callback.answer("Других объяснений нет", show_alert=True)
-        return
-    await _clear_theory_markup(callback.bot, callback.message.chat.id, state)
-    await _send_theory_edition(callback.message, state, topic, item)
-    await state.update_data(theory_edition=int(item.edition))
     await callback.answer()
+
+
+@router.message(Learn.waiting_answer, F.text == BTN_THEORY_MORE)
+async def theory_more_text(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    await delete_quietly(message.bot, message.chat.id, [message.message_id])
+    fail = await _advance_theory(message, state, session)
+    if fail:
+        await message.answer(fail)
 
 
 @router.callback_query(LearnCB.filter(F.action == "training"), Learn.waiting_answer)
 async def start_training(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
 ) -> None:
-    data = await state.get_data()
-    topic_id = data.get("topic_id")
-    if not topic_id:
-        await callback.answer("Сначала выбери тему", show_alert=True)
-        return
-    levels = await repos.list_difficulties(session, topic_id, "training")
-    if not levels:
-        await callback.answer("В теме нет тренировочных задач", show_alert=True)
-        return
-    if not data.get("session_id"):
-        learning = await repos.create_session(
-            session, callback.from_user.id, int(topic_id), "training"
-        )
-        await state.update_data(session_id=learning.id)
-        data = await state.get_data()
-    await repos.set_session_stage(session, data["session_id"], "training")
-    await nav.goto(state, {"s": "training", "t": int(topic_id)})
-    await state.update_data(
-        stage="training",
-        queue=[],
-        index=0,
-        used_problem_ids=[],
-        current_difficulty=levels[0],
+    fail = await _start_training(
+        callback.message, state, session, callback.from_user.id
     )
-    ok = await _send_training_problem(
-        callback.message,
-        state,
-        session,
-        difficulty=levels[0],
-        user_id=callback.from_user.id,
-        exclude_current=False,
-    )
-    if not ok:
-        await callback.answer("Не удалось выбрать задачу", show_alert=True)
+    if fail:
+        await callback.answer(fail, show_alert=True)
         return
     await callback.answer()
+
+
+@router.message(Learn.waiting_answer, F.text == BTN_TO_TRAINING)
+async def start_training_text(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    await delete_quietly(message.bot, message.chat.id, [message.message_id])
+    fail = await _start_training(message, state, session, message.from_user.id)
+    if fail:
+        await message.answer(fail)
 
 
 @router.callback_query(LearnCB.filter(F.action == "assessment"), Learn.waiting_answer)
 async def start_assessment(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
 ) -> None:
-    data = await state.get_data()
-    topic_id = data.get("topic_id")
-    if not topic_id:
-        await callback.answer("Сначала выбери тему", show_alert=True)
-        return
-    topic = await repos.get_topic(session, topic_id)
-    if topic is None:
-        await callback.answer("Тема не найдена", show_alert=True)
-        return
     from tutor_bot.handlers.common import ensure_user
-    from tutor_bot.handlers.student import _show_exam_info
 
     user = await ensure_user(session, callback.from_user)
-    await _show_exam_info(
-        callback.message, state, session, user, topic.id, edit=False
-    )
+    fail = await _open_assessment(callback.message, state, session, user)
+    if fail:
+        await callback.answer(fail, show_alert=True)
+        return
     await callback.answer()
+
+
+@router.message(Learn.waiting_answer, F.text == BTN_TO_EXAM)
+async def start_assessment_text(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    from tutor_bot.handlers.common import ensure_user
+
+    user = await ensure_user(session, message.from_user)
+    await delete_quietly(message.bot, message.chat.id, [message.message_id])
+    fail = await _open_assessment(message, state, session, user)
+    if fail:
+        await message.answer(fail)
 
 
 @router.callback_query(LearnCB.filter(F.action == "more"), Learn.waiting_answer)
 async def train_more(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
 ) -> None:
-    data = await state.get_data()
-    difficulty = int(data.get("current_difficulty") or 1)
-    ok = await _send_training_problem(
-        callback.message,
-        state,
-        session,
-        difficulty=difficulty,
-        user_id=callback.from_user.id,
-    )
-    if not ok:
-        await callback.answer("Задач этого уровня пока нет", show_alert=True)
+    fail = await _train_more(callback.message, state, session, callback.from_user.id)
+    if fail:
+        await callback.answer(fail, show_alert=True)
         return
     await callback.answer()
+
+
+@router.message(Learn.waiting_answer, F.text == BTN_TRAIN_MORE)
+async def train_more_text(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    await delete_quietly(message.bot, message.chat.id, [message.message_id])
+    fail = await _train_more(message, state, session, message.from_user.id)
+    if fail:
+        await message.answer(fail)
 
 
 @router.callback_query(LearnCB.filter(F.action == "level_up"), Learn.waiting_answer)
 async def train_level_up(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
 ) -> None:
-    data = await state.get_data()
-    topic_id = data.get("topic_id")
-    current = int(data.get("current_difficulty") or 1)
-    nxt = await _next_difficulty(session, topic_id, current)
-    if nxt is None:
-        await callback.answer("Это максимальный уровень", show_alert=True)
-        return
-    await state.update_data(current_difficulty=nxt, used_problem_ids=[])
-    ok = await _send_training_problem(
-        callback.message,
-        state,
-        session,
-        difficulty=nxt,
-        user_id=callback.from_user.id,
-        exclude_current=False,
+    fail = await _train_change_level(
+        callback.message, state, session, callback.from_user.id, up=True
     )
-    if not ok:
-        await callback.answer("На следующем уровне нет задач", show_alert=True)
+    if fail:
+        await callback.answer(fail, show_alert=True)
         return
-    await callback.answer(f"Уровень {nxt}")
+    await callback.answer()
+
+
+@router.message(Learn.waiting_answer, F.text == BTN_LEVEL_UP)
+async def train_level_up_text(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    await delete_quietly(message.bot, message.chat.id, [message.message_id])
+    fail = await _train_change_level(
+        message, state, session, message.from_user.id, up=True
+    )
+    if fail:
+        await message.answer(fail)
 
 
 @router.callback_query(LearnCB.filter(F.action == "level_down"), Learn.waiting_answer)
 async def train_level_down(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
 ) -> None:
-    data = await state.get_data()
-    topic_id = data.get("topic_id")
-    current = int(data.get("current_difficulty") or 1)
-    prev = await _prev_difficulty(session, topic_id, current)
-    if prev is None:
-        await callback.answer("Это минимальный уровень", show_alert=True)
-        return
-    await state.update_data(current_difficulty=prev, used_problem_ids=[])
-    ok = await _send_training_problem(
-        callback.message,
-        state,
-        session,
-        difficulty=prev,
-        user_id=callback.from_user.id,
-        exclude_current=False,
+    fail = await _train_change_level(
+        callback.message, state, session, callback.from_user.id, up=False
     )
-    if not ok:
-        await callback.answer("На предыдущем уровне нет задач", show_alert=True)
+    if fail:
+        await callback.answer(fail, show_alert=True)
         return
-    await callback.answer(f"Уровень {prev}")
+    await callback.answer()
+
+
+@router.message(Learn.waiting_answer, F.text == BTN_LEVEL_DOWN)
+async def train_level_down_text(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    await delete_quietly(message.bot, message.chat.id, [message.message_id])
+    fail = await _train_change_level(
+        message, state, session, message.from_user.id, up=False
+    )
+    if fail:
+        await message.answer(fail)
 
 
 @router.callback_query(LearnCB.filter(F.action == "hint"), Learn.waiting_answer)
@@ -778,14 +927,26 @@ async def handle_answer(
         topic_id = data.get("topic_id")
         nxt = await _next_difficulty(session, topic_id, problem.difficulty)
         prev = await _prev_difficulty(session, topic_id, problem.difficulty)
+        await state.update_data(
+            can_level_up=nxt is not None, can_level_down=prev is not None
+        )
         await _edit_problem(
             message,
             state,
             f"Верно.\n\nТренировка · {_difficulty_title(problem.difficulty)}",
-            after_correct_training_keyboard(
+            None,
+        )
+        sent = await message.answer(
+            "Верно. Выбери, что дальше:",
+            reply_markup=training_reply_keyboard(
                 can_level_up=nxt is not None,
                 can_level_down=prev is not None,
+                admin=is_admin(message.from_user.id),
             ),
+        )
+        await nav.attach_ids(state, [sent.message_id])
+        await nav.adopt_reply_kb(
+            message.bot, message.chat.id, state, sent.message_id
         )
         return
 

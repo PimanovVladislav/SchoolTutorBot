@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
@@ -90,6 +89,7 @@ async def collect_ui_ids(state: FSMContext) -> list[int]:
     for extra in (
         data.get("theory_message_id"),
         data.get("current_problem_message_id"),
+        data.get("reply_kb_id"),
     ):
         if extra:
             ids.append(int(extra))
@@ -113,6 +113,9 @@ async def wipe_ui(
     ids = await collect_ui_ids(state)
     if extra:
         ids.extend(extra)
+    data = await state.get_data()
+    if data.get("reply_kb_id"):
+        ids.append(int(data["reply_kb_id"]))
     await delete_quietly(bot, chat_id, ids)
     await state.update_data(
         ui_ids=[],
@@ -126,12 +129,56 @@ async def wipe_ui(
         exam_attempt_id=None,
         exam_problem_id=None,
         result_expanded=0,
+        reply_kb_id=None,
+        reply_kb_stub=False,
     )
 
 
-async def apply_reply_keyboard(target: Message, markup) -> None:
-    try:
-        stub = await target.answer("\u2063", reply_markup=markup)
-        await stub.delete()
-    except TelegramBadRequest:
-        await target.answer("Меню обновлено.", reply_markup=markup)
+async def forget_reply_kb_if_deleted(state: FSMContext, deleted_ids: list[int]) -> None:
+    owner = (await state.get_data()).get("reply_kb_id")
+    if owner and owner in set(deleted_ids):
+        await state.update_data(reply_kb_id=None)
+
+
+async def set_reply_kb_owner(state: FSMContext, message_id: int | None) -> None:
+    if not message_id:
+        return
+    await state.update_data(reply_kb_id=message_id)
+    await track_ui(state, [message_id])
+
+
+async def adopt_reply_kb(
+    bot: Bot,
+    chat_id: int,
+    state: FSMContext,
+    message_id: int,
+) -> None:
+    data = await state.get_data()
+    old = data.get("reply_kb_id")
+    was_stub = bool(data.get("reply_kb_stub"))
+    await set_reply_kb_owner(state, message_id)
+    await state.update_data(reply_kb_stub=False)
+    if was_stub and old and old != message_id:
+        await delete_quietly(bot, chat_id, [old])
+
+
+async def apply_reply_keyboard(
+    target: Message,
+    state: FSMContext,
+    markup,
+    *,
+    force: bool = False,
+    caption: str = "Выбери действие:",
+) -> None:
+    """Attach reply keyboard to a short real message. Never send an empty stub."""
+    data = await state.get_data()
+    old = data.get("reply_kb_id")
+    was_stub = bool(data.get("reply_kb_stub"))
+    if old and not force:
+        return
+    sent = await target.answer(caption, reply_markup=markup)
+    await attach_ids(state, [sent.message_id])
+    await set_reply_kb_owner(state, sent.message_id)
+    await state.update_data(reply_kb_stub=True)
+    if was_stub and old and old != sent.message_id:
+        await delete_quietly(target.bot, target.chat.id, [old])

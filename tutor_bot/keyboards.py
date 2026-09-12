@@ -22,6 +22,16 @@ BTN_SETTINGS = "Настройки"
 BTN_BACK = "Назад"
 BTN_HOME = "На главную"
 BTN_EXAM_FINISH = "Завершить работу"
+BTN_EXAM_START = "Приступить"
+BTN_THEORY_MORE = "Всё ещё непонятно"
+BTN_TO_TRAINING = "К тренировке"
+BTN_TO_EXAM = "К проверочной"
+BTN_TRAIN_MORE = "Решить ещё"
+BTN_LEVEL_UP = "Повысить уровень"
+BTN_LEVEL_DOWN = "Снизить сложность"
+BTN_CHANGE_CLASS = "Изменить класс/предмет"
+BTN_APPEAL = "Оставить обращение"
+BTN_SCHEDULE = "Расписание"
 BTN_TOPICS = "Выбрать тему"
 BTN_SUB = "Подписка"
 BTN_ADMIN = "Админка"
@@ -81,6 +91,16 @@ NAV_BUTTONS = {
     BTN_BACK,
     BTN_HOME,
     BTN_EXAM_FINISH,
+    BTN_EXAM_START,
+    BTN_THEORY_MORE,
+    BTN_TO_TRAINING,
+    BTN_TO_EXAM,
+    BTN_TRAIN_MORE,
+    BTN_LEVEL_UP,
+    BTN_LEVEL_DOWN,
+    BTN_CHANGE_CLASS,
+    BTN_APPEAL,
+    BTN_SCHEDULE,
     BTN_SUB,
     BTN_TOPICS,
     BTN_ADMIN,
@@ -108,14 +128,45 @@ def main_menu(*, admin: bool = False) -> ReplyKeyboardMarkup:
     ]
     if admin:
         keyboard.append([KeyboardButton(text=BTN_ADMIN)])
-    keyboard.append([KeyboardButton(text=BTN_BACK), KeyboardButton(text=BTN_HOME)])
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def menu_for(user_id: int) -> ReplyKeyboardMarkup:
     from tutor_bot.config import ADMIN_IDS
 
     return main_menu(admin=user_id in ADMIN_IDS)
+
+
+def section_keyboard(
+    extra_rows: list[list[str]] | None = None,
+    *,
+    admin: bool = False,
+) -> ReplyKeyboardMarkup:
+    keyboard: list[list[KeyboardButton]] = []
+    for row in extra_rows or []:
+        keyboard.append([KeyboardButton(text=cell) for cell in row])
+    keyboard.append(
+        [KeyboardButton(text=BTN_BACK), KeyboardButton(text=BTN_HOME)]
+    )
+    if admin:
+        keyboard.append([KeyboardButton(text=BTN_ADMIN)])
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def section_for(
+    user_id: int, extra_rows: list[list[str]] | None = None
+) -> ReplyKeyboardMarkup:
+    from tutor_bot.config import ADMIN_IDS
+
+    return section_keyboard(extra_rows, admin=user_id in ADMIN_IDS)
 
 
 def admin_menu() -> ReplyKeyboardMarkup:
@@ -230,6 +281,84 @@ def passed_status_note(grade: str) -> str:
     return f"лучшая оценка: {grade}"
 
 
+def parse_start_from_button(text: str | None) -> int | None:
+    raw = (text or "").strip()
+    match = re.fullmatch(r"Начать с\s+(\d+)", raw)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def learn_reply_keyboard(start_number: int, *, admin: bool = False) -> ReplyKeyboardMarkup:
+    return section_keyboard([[f"Начать с {start_number}"]], admin=admin)
+
+
+def exam_start_reply_keyboard(*, admin: bool = False) -> ReplyKeyboardMarkup:
+    return section_keyboard([[BTN_EXAM_START]], admin=admin)
+
+
+def theory_reply_keyboard(*, can_more: bool = True, admin: bool = False) -> ReplyKeyboardMarkup:
+    extra: list[list[str]] = []
+    if can_more:
+        extra.append([BTN_THEORY_MORE])
+    extra.append([BTN_TO_TRAINING])
+    extra.append([BTN_TO_EXAM])
+    return section_keyboard(extra, admin=admin)
+
+
+def training_reply_keyboard(
+    *, can_level_up: bool, can_level_down: bool = False, admin: bool = False
+) -> ReplyKeyboardMarkup:
+    extra: list[list[str]] = [[BTN_TRAIN_MORE]]
+    level: list[str] = []
+    if can_level_down:
+        level.append(BTN_LEVEL_DOWN)
+    if can_level_up:
+        level.append(BTN_LEVEL_UP)
+    if level:
+        extra.append(level)
+    extra.append([BTN_TO_EXAM])
+    return section_keyboard(extra, admin=admin)
+
+
+def settings_reply_keyboard(*, admin: bool = False) -> ReplyKeyboardMarkup:
+    return section_keyboard(
+        [
+            [BTN_CHANGE_CLASS],
+            [BTN_SUB],
+            [BTN_APPEAL],
+            [BTN_SCHEDULE],
+        ],
+        admin=admin,
+    )
+
+
+def exam_result_button_text(sort_order: int, is_correct, submitted: str | None) -> str:
+    if is_correct:
+        status = "верно"
+    elif (submitted or "").strip():
+        status = "неверно"
+    else:
+        status = "нет ответа"
+    return fit_button_text(f"{sort_order} · {status}")
+
+
+def parse_exam_result_button(text: str | None) -> int | None:
+    raw = (text or "").strip()
+    match = re.fullmatch(r"(\d+)\s*[·•.]\s*(верно|неверно|нет ответа)", raw)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def exam_result_reply_keyboard(answers, *, admin: bool = False) -> ReplyKeyboardMarkup:
+    extra = [
+        [exam_result_button_text(item.sort_order, item.is_correct, item.submitted)]
+        for item in answers
+    ]
+    return section_keyboard(extra, admin=admin)
+
+
 def learn_start_keyboard(start_number: int, topic_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -285,7 +414,11 @@ def exam_reply_keyboard(answers, *, admin: bool = False) -> ReplyKeyboardMarkup:
     )
     if admin:
         keyboard.append([KeyboardButton(text=BTN_ADMIN)])
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def exam_result_keyboard(

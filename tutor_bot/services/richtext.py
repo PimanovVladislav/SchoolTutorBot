@@ -262,8 +262,11 @@ async def send_rich(
         else:
             blocks.insert(0, Block("text", header))
     if not blocks:
+        kwargs = {}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
         sent = await target.bot.send_message(
-            target.chat.id, header or "…", reply_markup=reply_markup
+            target.chat.id, header or "…", **kwargs
         )
         return [sent.message_id]
 
@@ -271,6 +274,28 @@ async def send_rich(
     bot = target.bot
     chat_id = target.chat.id
     last_index = len(blocks) - 1
+
+    async def _send_text(text: str, markup) -> int:
+        kwargs = {}
+        if markup is not None:
+            kwargs["reply_markup"] = markup
+        sent = await bot.send_message(chat_id, text, **kwargs)
+        return sent.message_id
+
+    async def _send_photo(file, markup) -> int:
+        kwargs = {}
+        if markup is not None:
+            kwargs["reply_markup"] = markup
+        sent = await bot.send_photo(chat_id, file, **kwargs)
+        return sent.message_id
+
+    async def _send_video(file, markup) -> int:
+        kwargs = {}
+        if markup is not None:
+            kwargs["reply_markup"] = markup
+        sent = await bot.send_video(chat_id, file, **kwargs)
+        return sent.message_id
+
     for index, block in enumerate(blocks):
         is_last = index == last_index
         markup = reply_markup if is_last else None
@@ -280,40 +305,25 @@ async def send_rich(
                 continue
             for piece_i, piece in enumerate(pieces):
                 piece_last = is_last and piece_i == len(pieces) - 1
-                sent = await bot.send_message(
-                    chat_id, piece, reply_markup=markup if piece_last else None
-                )
-                ids.append(sent.message_id)
+                ids.append(await _send_text(piece, markup if piece_last else None))
             continue
         if block.kind == "formula":
             path = _render_formula(block.content)
             if path and path.is_file():
-                sent = await bot.send_photo(
-                    chat_id, FSInputFile(path), reply_markup=markup
-                )
+                ids.append(await _send_photo(FSInputFile(path), markup))
             else:
-                sent = await bot.send_message(
-                    chat_id,
-                    f"<code>{html.escape(block.content)}</code>",
-                    reply_markup=markup,
+                ids.append(
+                    await _send_text(
+                        f"<code>{html.escape(block.content)}</code>", markup
+                    )
                 )
-            ids.append(sent.message_id)
             continue
         path = media_path(block.content)
         if block.kind == "photo" and path.is_file():
-            sent = await bot.send_photo(
-                chat_id, FSInputFile(path), reply_markup=markup
-            )
-            ids.append(sent.message_id)
+            ids.append(await _send_photo(FSInputFile(path), markup))
             continue
         if block.kind == "video" and path.is_file():
-            sent = await bot.send_video(
-                chat_id, FSInputFile(path), reply_markup=markup
-            )
-            ids.append(sent.message_id)
+            ids.append(await _send_video(FSInputFile(path), markup))
             continue
-        sent = await bot.send_message(
-            chat_id, html.escape(block.content), reply_markup=markup
-        )
-        ids.append(sent.message_id)
+        ids.append(await _send_text(html.escape(block.content), markup))
     return ids

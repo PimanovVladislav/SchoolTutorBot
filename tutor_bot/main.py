@@ -5,7 +5,6 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
 
 from tutor_bot.config import BOT_TOKEN, REDIS_URL
 from tutor_bot.content import seed_curriculum
@@ -43,15 +42,7 @@ async def _init_db() -> None:
 
 
 async def _set_commands(bot: Bot) -> None:
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Начало, предмет и класс"),
-            BotCommand(command="learn", description="Продолжить обучение"),
-            BotCommand(command="progress", description="Мой прогресс"),
-            BotCommand(command="settings", description="Настройки"),
-            BotCommand(command="cancel", description="Сбросить текущее действие"),
-        ]
-    )
+    await bot.delete_my_commands()
 
 
 async def main() -> None:

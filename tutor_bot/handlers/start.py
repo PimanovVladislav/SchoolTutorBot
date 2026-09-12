@@ -45,12 +45,13 @@ async def cmd_start(
             prefix=f"Привет, {name}!\n\n{INTRO}\n\n",
         )
         return
-    await message.answer(
+    sent = await message.answer(
         f"С возвращением, {name}!\n"
         f"Класс: {user.grade}. Доступ: {access_label(access)}.\n\n"
         f"{INTRO}",
         reply_markup=menu_for(user.id),
     )
+    await nav.adopt_reply_kb(message.bot, message.chat.id, state, sent.message_id)
 
 
 async def _ask_subject(
@@ -67,7 +68,6 @@ async def _ask_subject(
     )
     await nav.reset_stack(state, {"s": "subjects"})
     await nav.attach_ids(state, [sent.message_id])
-    await nav.apply_reply_keyboard(message, menu_for(message.from_user.id))
 
 
 @router.callback_query(SubjectCB.filter(), Onboarding.subject)
@@ -120,7 +120,10 @@ async def onboarding_grade(
         else f"Готово: {callback_data.grade} класс, {title}.\n"
         "Можно заниматься. Нажми «Продолжить обучение» или «Мой прогресс»."
     )
-    await callback.message.answer(text, reply_markup=menu_for(user.id))
+    sent = await callback.message.answer(text, reply_markup=menu_for(user.id))
+    await nav.adopt_reply_kb(
+        callback.bot, callback.message.chat.id, state, sent.message_id
+    )
     await callback.answer()
 
 
