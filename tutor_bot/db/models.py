@@ -261,11 +261,56 @@ class TopicProgress(Base):
     theory_done: Mapped[bool] = mapped_column(Boolean, default=False)
     training_done: Mapped[bool] = mapped_column(Boolean, default=False)
     assessment_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    best_grade: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
     reinforcement_correct: Mapped[int] = mapped_column(Integer, default=0)
     reinforcement_total: Mapped[int] = mapped_column(Integer, default=0)
     mastery: Mapped[str] = mapped_column(String(32), default="not_started")
     last_activity_at: Mapped[datetime] = mapped_column(
         DateTime, default=utcnow, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AssessmentAttempt(Base):
+    __tablename__ = "assessment_attempts"
+    __table_args__ = (
+        Index("ix_assessment_user_topic", "user_id", "topic_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    topic_id: Mapped[int] = mapped_column(ForeignKey("topics.id", ondelete="CASCADE"))
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(32), default="in_progress")
+    correct_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    grade: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    problem_ids: Mapped[str] = mapped_column(Text, default="")
+    panel_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    answers: Mapped[list["AssessmentAnswer"]] = relationship(
+        back_populates="attempt",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+class AssessmentAnswer(Base):
+    __tablename__ = "assessment_answers"
+    __table_args__ = (UniqueConstraint("attempt_id", "problem_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    attempt_id: Mapped[int] = mapped_column(
+        ForeignKey("assessment_attempts.id", ondelete="CASCADE")
+    )
+    problem_id: Mapped[int] = mapped_column(ForeignKey("problems.id"))
+    sort_order: Mapped[int] = mapped_column(Integer, default=1)
+    submitted: Mapped[str] = mapped_column(String(255), default="")
+    is_correct: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    attempt: Mapped[AssessmentAttempt] = relationship(
+        back_populates="answers", lazy="raise"
     )
 
 

@@ -1,13 +1,12 @@
-from pathlib import Path
 from types import SimpleNamespace
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tutor_bot.config import PROJECT_ROOT, TRAINING_REPEAT_DAYS, WRONG_ATTEMPTS_BEFORE_HELP
+from tutor_bot.config import TRAINING_REPEAT_DAYS, WRONG_ATTEMPTS_BEFORE_HELP
 from tutor_bot.db import repos
 from tutor_bot.db.models import Problem, Topic, User
 from tutor_bot.keyboards import (
@@ -32,8 +31,9 @@ from tutor_bot.services.learning import (
     apply_assessment_score,
     apply_reinforcement_result,
     build_start_queue,
-    pick_assessment_queue,
 )
+from tutor_bot.services import nav
+from tutor_bot.services.richtext import send_rich
 from tutor_bot.services.scoring import MASTERY_LABELS, mastery_from_score
 from tutor_bot.states import Learn
 
@@ -44,14 +44,6 @@ KIND_TITLES = {
     "training": "Тренировка",
     "assessment": "Проверочная",
 }
-THEORY_LIMIT = 4000
-
-
-def _media_path(raw: str) -> Path:
-    path = Path(raw)
-    if not path.is_absolute():
-        path = PROJECT_ROOT / raw
-    return path
 
 
 def _difficulty_title(level: int) -> str:
@@ -66,7 +58,7 @@ def _problem_text(stage: str, problem: Problem, *, extra: str = "") -> str:
     header = f"<b>{title}</b>\nЗадание #{problem.id}"
     if extra:
         header += f" · {extra}"
-    return f"{header}\n\n{problem.prompt}"
+    return header
 
 
 async def start_topic(
@@ -76,38 +68,31 @@ async def start_topic(
     user: User,
     topic: Topic,
 ) -> None:
+    await show_topic_theory(message, state, session, user, topic)
+
+
+async def show_topic_theory(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    user: User,
+    topic: Topic,
+) -> None:
     await wipe_lesson(message.bot, message.chat.id, state)
     await repos.set_current_topic(session, user.id, topic.id)
-    learning = await repos.create_session(session, user.id, topic.id, stage="theory")
     progress = await repos.get_or_create_progress(session, user.id, topic.id)
+    progress.theory_done = True
     if progress.mastery == "not_started":
         progress.mastery = "learning"
-    reinforcement_ids = await build_start_queue(
-        session, user.id, topic, include_reinforcement=True
-    )
+    learning = await repos.create_session(session, user.id, topic.id, "theory")
     await state.set_state(Learn.waiting_answer)
     await state.update_data(
         session_id=learning.id,
         topic_id=topic.id,
-        queue=[],
-        index=0,
-        attempt_count=0,
-        used_help=False,
-        hint_used=False,
-        current_problem_id=None,
-        current_difficulty=1,
-        used_problem_ids=[],
         stage="theory",
-        problem_base_text="",
         theory_edition=1,
-        hint_edition=0,
-        solution_edition=0,
+        current_problem_id=None,
     )
-    if reinforcement_ids:
-        await repos.set_session_stage(session, learning.id, "reinforcement")
-        await state.update_data(stage="reinforcement", queue=reinforcement_ids, index=0)
-        await _send_current_problem(message, state, session)
-        return
     await _send_theory(message, state, session, topic)
 
 
@@ -157,26 +142,19 @@ async def _send_theory_edition(
         header += f"\nРедакция {item.edition} из {total}"
     kind = (item.kind or "text").lower()
     image_path = getattr(item, "image_path", None)
-    if kind == "photo" and image_path:
-        path = _media_path(image_path)
-        if path.is_file():
-            sent = await target.bot.send_photo(
-                target.chat.id,
-                FSInputFile(path),
-                caption=header[:1024],
-                reply_markup=markup,
-            )
-            await track_theory(state, sent.message_id)
-            return
-    text = item.body or topic.summary or topic.title
-    if total > 1 or not str(text).startswith("<b>"):
-        text = f"{header}\n\n{text}"
-    if len(text) > THEORY_LIMIT:
-        text = text[: THEORY_LIMIT - 1] + "…"
-    sent = await target.bot.send_message(
-        target.chat.id, text, reply_markup=markup
+    extra_photo = image_path if kind == "photo" and image_path else None
+    body = item.body or topic.summary or topic.title
+    ids = await send_rich(
+        target,
+        body,
+        header=header,
+        reply_markup=markup,
+        extra_photo=extra_photo,
     )
-    await track_theory(state, sent.message_id)
+    for message_id in ids:
+        await track_theory(state, message_id)
+    await nav.attach_ids(state, ids)
+    await nav.apply_reply_keyboard(target, menu_for(target.chat.id))
 
 
 async def _send_theory(
@@ -221,18 +199,22 @@ async def _present_problem(
     extra: str = "",
 ) -> None:
     await wipe_ephemeral(target.bot, target.chat.id, state)
-    text = _problem_text(stage, problem, extra=extra)
+    header = _problem_text(stage, problem, extra=extra)
     hints = await repos.list_hint_bodies(session, problem)
-    sent = await target.bot.send_message(
-        target.chat.id,
-        text,
+    ids = await send_rich(
+        target,
+        problem.prompt,
+        header=header,
         reply_markup=answer_keyboard(
             show_help=False,
             can_skip=stage == "training",
             show_hint=bool(hints),
         ),
     )
-    await track_ephemeral(state, sent.message_id)
+    for message_id in ids:
+        await track_ephemeral(state, message_id)
+    await nav.attach_ids(state, ids)
+    await nav.apply_reply_keyboard(target, menu_for(target.chat.id))
     used = list((await state.get_data()).get("used_problem_ids") or [])
     if problem.id not in used:
         used.append(problem.id)
@@ -243,7 +225,7 @@ async def _present_problem(
         hint_used=False,
         hint_edition=0,
         solution_edition=0,
-        problem_base_text=text,
+        problem_base_text=header,
         used_problem_ids=used,
         current_difficulty=problem.difficulty,
     )
@@ -289,6 +271,14 @@ async def _next_difficulty(
     levels = await repos.list_difficulties(session, topic_id, "training")
     higher = [level for level in levels if level > current]
     return higher[0] if higher else None
+
+
+async def _prev_difficulty(
+    session: AsyncSession, topic_id: int, current: int
+) -> int | None:
+    levels = await repos.list_difficulties(session, topic_id, "training")
+    lower = [level for level in levels if level < current]
+    return lower[-1] if lower else None
 
 
 async def _finish_stage(
@@ -398,6 +388,21 @@ def _problem_keyboard(
     )
 
 
+async def _refresh_problem_keyboard(target: Message, state: FSMContext, markup) -> None:
+    data = await state.get_data()
+    message_id = data.get("current_problem_message_id")
+    if not message_id:
+        return
+    try:
+        await target.bot.edit_message_reply_markup(
+            chat_id=target.chat.id,
+            message_id=message_id,
+            reply_markup=markup,
+        )
+    except TelegramBadRequest:
+        pass
+
+
 @router.callback_query(TopicCB.filter(F.action == "open"))
 async def open_topic(
     callback: CallbackQuery,
@@ -417,7 +422,7 @@ async def open_topic(
     if topic is None:
         await callback.answer("Тема не найдена", show_alert=True)
         return
-    await start_topic(callback.message, state, session, user, topic)
+    await show_topic_theory(callback.message, state, session, user, topic)
     await callback.answer()
 
 
@@ -455,17 +460,14 @@ async def start_training(
     if not levels:
         await callback.answer("В теме нет тренировочных задач", show_alert=True)
         return
-    theory_id = data.get("theory_message_id")
-    if theory_id:
-        try:
-            await callback.bot.edit_message_reply_markup(
-                chat_id=callback.message.chat.id,
-                message_id=theory_id,
-                reply_markup=None,
-            )
-        except TelegramBadRequest:
-            pass
+    if not data.get("session_id"):
+        learning = await repos.create_session(
+            session, callback.from_user.id, int(topic_id), "training"
+        )
+        await state.update_data(session_id=learning.id)
+        data = await state.get_data()
     await repos.set_session_stage(session, data["session_id"], "training")
+    await nav.goto(state, {"s": "training", "t": int(topic_id)})
     await state.update_data(
         stage="training",
         queue=[],
@@ -500,17 +502,13 @@ async def start_assessment(
     if topic is None:
         await callback.answer("Тема не найдена", show_alert=True)
         return
-    queue = await pick_assessment_queue(session, topic)
-    if not queue:
-        await callback.answer("В теме нет проверочных задач", show_alert=True)
-        return
-    progress = await repos.get_or_create_progress(
-        session, callback.from_user.id, topic.id
+    from tutor_bot.handlers.common import ensure_user
+    from tutor_bot.handlers.student import _show_exam_info
+
+    user = await ensure_user(session, callback.from_user)
+    await _show_exam_info(
+        callback.message, state, session, user, topic.id, edit=False
     )
-    progress.training_done = True
-    await repos.set_session_stage(session, data["session_id"], "assessment")
-    await state.update_data(stage="assessment", queue=queue, index=0)
-    await _send_current_problem(callback.message, state, session)
     await callback.answer()
 
 
@@ -559,6 +557,32 @@ async def train_level_up(
     await callback.answer(f"Уровень {nxt}")
 
 
+@router.callback_query(LearnCB.filter(F.action == "level_down"), Learn.waiting_answer)
+async def train_level_down(
+    callback: CallbackQuery, state: FSMContext, session: AsyncSession
+) -> None:
+    data = await state.get_data()
+    topic_id = data.get("topic_id")
+    current = int(data.get("current_difficulty") or 1)
+    prev = await _prev_difficulty(session, topic_id, current)
+    if prev is None:
+        await callback.answer("Это минимальный уровень", show_alert=True)
+        return
+    await state.update_data(current_difficulty=prev, used_problem_ids=[])
+    ok = await _send_training_problem(
+        callback.message,
+        state,
+        session,
+        difficulty=prev,
+        user_id=callback.from_user.id,
+        exclude_current=False,
+    )
+    if not ok:
+        await callback.answer("На предыдущем уровне нет задач", show_alert=True)
+        return
+    await callback.answer(f"Уровень {prev}")
+
+
 @router.callback_query(LearnCB.filter(F.action == "hint"), Learn.waiting_answer)
 async def show_hint(
     callback: CallbackQuery, state: FSMContext, session: AsyncSession
@@ -576,22 +600,21 @@ async def show_hint(
         return
     await state.update_data(hint_used=True, hint_edition=shown)
     data = await state.get_data()
-    sol_shown = int(data.get("solution_edition") or 0)
-    wrong = int(data.get("attempt_count") or 0) > 0
-    await _edit_problem(
+    ids = await send_rich(
+        callback.message,
+        hints[shown - 1],
+        header=f"<b>Подсказка {shown}</b>",
+    )
+    for message_id in ids:
+        await track_ephemeral(state, message_id, control=False)
+    await _refresh_problem_keyboard(
         callback.message,
         state,
-        _compose_problem_view(
-            data.get("problem_base_text") or problem.prompt,
-            hints[:shown],
-            solutions[:sol_shown],
-            wrong=wrong,
-        ),
         _problem_keyboard(
             data,
             hint_total=len(hints),
             solution_total=len(solutions),
-            show_report=wrong,
+            show_report=int(data.get("attempt_count") or 0) > 0,
         ),
     )
     await callback.answer()
@@ -630,21 +653,21 @@ async def show_help(
             )
     data = await state.get_data()
     hint_shown = int(data.get("hint_edition") or 0)
-    wrong = int(data.get("attempt_count") or 0) > 0
-    await _edit_problem(
+    ids = await send_rich(
+        callback.message,
+        solutions[shown - 1],
+        header=f"<b>Разбор {shown}</b>",
+    )
+    for message_id in ids:
+        await track_ephemeral(state, message_id, control=False)
+    await _refresh_problem_keyboard(
         callback.message,
         state,
-        _compose_problem_view(
-            data.get("problem_base_text") or problem.prompt,
-            hints[:hint_shown],
-            solutions[:shown],
-            wrong=wrong,
-        ),
         _problem_keyboard(
             data,
             hint_total=len(hints),
             solution_total=len(solutions),
-            show_report=wrong,
+            show_report=int(data.get("attempt_count") or 0) > 0,
         ),
     )
     await callback.answer()
@@ -754,11 +777,15 @@ async def handle_answer(
             return
         topic_id = data.get("topic_id")
         nxt = await _next_difficulty(session, topic_id, problem.difficulty)
+        prev = await _prev_difficulty(session, topic_id, problem.difficulty)
         await _edit_problem(
             message,
             state,
             f"Верно.\n\nТренировка · {_difficulty_title(problem.difficulty)}",
-            after_correct_training_keyboard(can_level_up=nxt is not None),
+            after_correct_training_keyboard(
+                can_level_up=nxt is not None,
+                can_level_down=prev is not None,
+            ),
         )
         return
 
@@ -769,17 +796,14 @@ async def handle_answer(
     data = await state.get_data()
     hints = await repos.list_hint_bodies(session, problem)
     solutions = await repos.list_solution_bodies(session, problem)
-    hint_shown = int(data.get("hint_edition") or 0)
-    sol_shown = int(data.get("solution_edition") or 0)
-    await _edit_problem(
+    sent = await message.bot.send_message(
+        message.chat.id,
+        "<i>Пока неверно. Попробуй ещё раз.</i>",
+    )
+    await track_ephemeral(state, sent.message_id, control=False)
+    await _refresh_problem_keyboard(
         message,
         state,
-        _compose_problem_view(
-            data.get("problem_base_text") or problem.prompt,
-            hints[:hint_shown],
-            solutions[:sol_shown],
-            wrong=True,
-        ),
         _problem_keyboard(
             data,
             hint_total=len(hints),

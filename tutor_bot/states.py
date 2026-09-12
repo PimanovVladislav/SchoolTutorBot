@@ -2,11 +2,15 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class Onboarding(StatesGroup):
+    subject = State()
     grade = State()
 
 
 class Learn(StatesGroup):
+    pick_topic = State()
     waiting_answer = State()
+    exam_work = State()
+    exam_answer = State()
 
 
 class Admin(StatesGroup):
@@ -16,6 +20,7 @@ class Admin(StatesGroup):
     topic_summary = State()
     topic_theory = State()
     topic_assessment = State()
+    topic_number = State()
     problem_prompt = State()
     problem_answer = State()
     problem_hint = State()

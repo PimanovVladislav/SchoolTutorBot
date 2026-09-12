@@ -8,7 +8,7 @@ MATH_SCHOOL_TOPICS: list[dict] = [
         "slug": "fraction-addition",
         "title": "Сложение и вычитание обыкновенных дробей",
         "summary": "Общий знаменатель, НОК, сложение и вычитание дробей.",
-        "sort_order": 10,
+        "sort_order": 1,
         "assessment_required": 3,
         "theory_kind": "text",
         "theory": (
@@ -180,7 +180,7 @@ MATH_SCHOOL_TOPICS: list[dict] = [
         "slug": "linear-equations",
         "title": "Линейные уравнения",
         "summary": "Уравнения вида ax + b = c, перенос слагаемых, деление.",
-        "sort_order": 10,
+        "sort_order": 1,
         "assessment_required": 3,
         "theory_kind": "text",
         "theory": (
@@ -293,7 +293,7 @@ MATH_SCHOOL_TOPICS: list[dict] = [
         "slug": "quadratic-equations",
         "title": "Квадратные уравнения",
         "summary": "Дискриминант и формула корней квадратного уравнения.",
-        "sort_order": 10,
+        "sort_order": 1,
         "assessment_required": 3,
         "theory_kind": "text",
         "theory": (
@@ -409,7 +409,7 @@ MATH_SCHOOL_TOPICS: list[dict] = [
         "slug": "pythagorean-theorem",
         "title": "Теорема Пифагора",
         "summary": "Связь сторон прямоугольного треугольника, гипотенуза и катеты.",
-        "sort_order": 10,
+        "sort_order": 1,
         "assessment_required": 3,
         "theory_kind": "text",
         "theory": (

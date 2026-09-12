@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from tutor_bot.db.models import (
+    AssessmentAnswer,
+    AssessmentAttempt,
     Attempt,
     GradeOption,
     LearningSession,
@@ -21,6 +23,7 @@ from tutor_bot.db.models import (
     User,
     UserProblemStat,
 )
+from tutor_bot.services.topics import plan_topic_insert
 
 
 async def upsert_user(
@@ -150,6 +153,22 @@ async def list_topics_for_grade(
 
 async def get_topic(session: AsyncSession, topic_id: int) -> Optional[Topic]:
     return await session.get(Topic, topic_id)
+
+
+async def get_topic_by_number(
+    session: AsyncSession, track_id: int, grade: int, number: int
+) -> Optional[Topic]:
+    stmt = (
+        select(Topic)
+        .where(
+            Topic.track_id == track_id,
+            Topic.grade == grade,
+            Topic.sort_order == number,
+        )
+        .order_by(Topic.id)
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
 
 
 async def list_problems(
@@ -483,6 +502,23 @@ async def default_track_for_subject(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def allocate_topic_number(
+    session: AsyncSession,
+    track_id: int,
+    grade: int,
+    requested: int | None,
+) -> int:
+    topics = list(await list_topics_for_grade(session, track_id, grade))
+    number, shifted = plan_topic_insert(
+        [item.sort_order for item in topics], requested
+    )
+    for topic, new_order in reversed(list(zip(topics, shifted))):
+        if topic.sort_order != new_order:
+            topic.sort_order = new_order
+    await session.flush()
+    return number
+
+
 async def create_topic(
     session: AsyncSession,
     *,
@@ -494,15 +530,10 @@ async def create_topic(
     theory_kind: str,
     theory_image_path: Optional[str],
     assessment_required: int,
+    number: Optional[int] = None,
 ) -> Topic:
     slug = f"t-{int(datetime.utcnow().timestamp())}"
-    max_order = (
-        await session.execute(
-            select(func.max(Topic.sort_order)).where(
-                Topic.track_id == track_id, Topic.grade == grade
-            )
-        )
-    ).scalar_one()
+    sort_order = await allocate_topic_number(session, track_id, grade, number)
     item = Topic(
         track_id=track_id,
         grade=grade,
@@ -513,7 +544,7 @@ async def create_topic(
         theory_kind=theory_kind,
         theory_image_path=theory_image_path,
         assessment_required=max(1, assessment_required),
-        sort_order=(max_order or 0) + 10,
+        sort_order=sort_order,
     )
     session.add(item)
     await session.flush()
@@ -892,4 +923,163 @@ async def upsert_problem_solution(
         if problem is not None:
             problem.solution = body
     return row
+
+
+def parse_id_list(raw: str | None) -> list[int]:
+    if not raw:
+        return []
+    return [int(part) for part in raw.split(",") if part.strip().isdigit()]
+
+
+def join_id_list(ids: list[int]) -> str:
+    return ",".join(str(item) for item in ids)
+
+
+async def get_active_attempt(
+    session: AsyncSession, user_id: int, topic_id: int
+) -> Optional[AssessmentAttempt]:
+    stmt = (
+        select(AssessmentAttempt)
+        .where(
+            AssessmentAttempt.user_id == user_id,
+            AssessmentAttempt.topic_id == topic_id,
+            AssessmentAttempt.status == "in_progress",
+        )
+        .order_by(AssessmentAttempt.id.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def get_attempt(
+    session: AsyncSession, attempt_id: int
+) -> Optional[AssessmentAttempt]:
+    return await session.get(AssessmentAttempt, attempt_id)
+
+
+async def list_topic_attempts(
+    session: AsyncSession, user_id: int, topic_id: int
+) -> Sequence[AssessmentAttempt]:
+    stmt = (
+        select(AssessmentAttempt)
+        .where(
+            AssessmentAttempt.user_id == user_id,
+            AssessmentAttempt.topic_id == topic_id,
+            AssessmentAttempt.status.in_(("completed", "expired")),
+        )
+        .order_by(AssessmentAttempt.started_at.asc(), AssessmentAttempt.id.asc())
+    )
+    return (await session.execute(stmt)).scalars().all()
+
+
+async def list_attempts_for_topics(
+    session: AsyncSession, user_id: int, topic_ids: list[int]
+) -> Sequence[AssessmentAttempt]:
+    if not topic_ids:
+        return []
+    stmt = select(AssessmentAttempt).where(
+        AssessmentAttempt.user_id == user_id,
+        AssessmentAttempt.topic_id.in_(topic_ids),
+    )
+    return (await session.execute(stmt)).scalars().all()
+
+
+async def count_max_scores(
+    session: AsyncSession,
+    user_id: int,
+    topic_id: int,
+    *,
+    exclude_id: Optional[int] = None,
+) -> int:
+    filters = [
+        AssessmentAttempt.user_id == user_id,
+        AssessmentAttempt.topic_id == topic_id,
+        AssessmentAttempt.status.in_(("completed", "expired")),
+        AssessmentAttempt.correct_count.is_not(None),
+        AssessmentAttempt.correct_count == AssessmentAttempt.total,
+        AssessmentAttempt.total > 0,
+    ]
+    if exclude_id:
+        filters.append(AssessmentAttempt.id != exclude_id)
+    return int(
+        (
+            await session.execute(
+                select(func.count()).select_from(AssessmentAttempt).where(*filters)
+            )
+        ).scalar_one()
+        or 0
+    )
+
+
+async def create_assessment_attempt(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    topic_id: int,
+    problem_ids: list[int],
+    deadline_at: datetime,
+    started_at: datetime,
+) -> AssessmentAttempt:
+    attempt = AssessmentAttempt(
+        user_id=user_id,
+        topic_id=topic_id,
+        started_at=started_at,
+        deadline_at=deadline_at,
+        status="in_progress",
+        total=len(problem_ids),
+        problem_ids=join_id_list(problem_ids),
+    )
+    session.add(attempt)
+    await session.flush()
+    for index, problem_id in enumerate(problem_ids, start=1):
+        session.add(
+            AssessmentAnswer(
+                attempt_id=attempt.id,
+                problem_id=problem_id,
+                sort_order=index,
+                submitted="",
+            )
+        )
+    await session.flush()
+    return attempt
+
+
+async def get_attempt_answers(
+    session: AsyncSession, attempt_id: int
+) -> Sequence[AssessmentAnswer]:
+    stmt = (
+        select(AssessmentAnswer)
+        .where(AssessmentAnswer.attempt_id == attempt_id)
+        .order_by(AssessmentAnswer.sort_order, AssessmentAnswer.id)
+    )
+    return (await session.execute(stmt)).scalars().all()
+
+
+async def save_attempt_answer(
+    session: AsyncSession, attempt_id: int, problem_id: int, submitted: str
+) -> Optional[AssessmentAnswer]:
+    stmt = select(AssessmentAnswer).where(
+        AssessmentAnswer.attempt_id == attempt_id,
+        AssessmentAnswer.problem_id == problem_id,
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        return None
+    row.submitted = submitted
+    return row
+
+
+async def finish_attempt(
+    session: AsyncSession,
+    attempt: AssessmentAttempt,
+    *,
+    finished_at: datetime,
+    status: str,
+    correct_count: int,
+    grade: str,
+) -> None:
+    attempt.finished_at = finished_at
+    attempt.status = status
+    attempt.correct_count = correct_count
+    attempt.grade = grade
 

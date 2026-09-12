@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tutor_bot.db import repos
 from tutor_bot.db.models import Problem, Topic
+from tutor_bot.services.grades import assessment_size
 from tutor_bot.services.scoring import mastery_from_score, percent, problem_points
 
 
@@ -27,14 +28,25 @@ async def build_start_queue(
     return [p.id for p in sample[:2]]
 
 
-async def pick_assessment_queue(session: AsyncSession, topic: Topic) -> list[int]:
+async def pick_assessment_queue(
+    session: AsyncSession,
+    topic: Topic,
+    *,
+    avoid_ids: list[int] | None = None,
+) -> list[int]:
     problems = list(await repos.list_problems(session, topic.id, "assessment"))
     if not problems:
         return []
-    required = max(1, int(topic.assessment_required or 3))
-    count = min(required, len(problems))
-    chosen = random.sample(problems, count)
-    return [p.id for p in chosen]
+    count = assessment_size(topic.assessment_required, len(problems))
+    if count <= 0:
+        return []
+    avoid = set(avoid_ids or [])
+    pool = [item for item in problems if item.id not in avoid]
+    if len(pool) < count:
+        pool = problems
+    chosen = random.sample(pool, count)
+    random.shuffle(chosen)
+    return [item.id for item in chosen]
 
 
 async def apply_assessment_score(

@@ -45,12 +45,11 @@ async def _init_db() -> None:
 async def _set_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
-            BotCommand(command="start", description="Начало и выбор класса"),
+            BotCommand(command="start", description="Начало, предмет и класс"),
             BotCommand(command="learn", description="Продолжить обучение"),
-            BotCommand(command="topics", description="Выбрать тему"),
             BotCommand(command="progress", description="Мой прогресс"),
-            BotCommand(command="subscribe", description="Подписка"),
-            BotCommand(command="cancel", description="Сбросить текущее задание"),
+            BotCommand(command="settings", description="Настройки"),
+            BotCommand(command="cancel", description="Сбросить текущее действие"),
         ]
     )
 

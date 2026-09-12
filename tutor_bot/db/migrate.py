@@ -13,6 +13,10 @@ _PROBLEM_COLUMNS = {
     "needs_review": "ALTER TABLE problems ADD COLUMN needs_review TINYINT(1) NOT NULL DEFAULT 0",
 }
 
+_PROGRESS_COLUMNS = {
+    "best_grade": "ALTER TABLE topic_progress ADD COLUMN best_grade VARCHAR(8) NULL",
+}
+
 
 def apply_schema(sync_conn) -> None:
     Base.metadata.create_all(sync_conn)
@@ -28,7 +32,28 @@ def apply_schema(sync_conn) -> None:
         for name, ddl in _PROBLEM_COLUMNS.items():
             if name not in existing:
                 sync_conn.execute(text(ddl))
+    if "topic_progress" in tables:
+        existing = {col["name"] for col in inspector.get_columns("topic_progress")}
+        for name, ddl in _PROGRESS_COLUMNS.items():
+            if name not in existing:
+                sync_conn.execute(text(ddl))
+        sync_conn.execute(
+            text(
+                """
+                UPDATE topic_progress
+                SET best_grade = CASE
+                    WHEN assessment_score IS NULL THEN best_grade
+                    WHEN assessment_score >= 90 THEN '5'
+                    WHEN assessment_score >= 70 THEN '4'
+                    WHEN assessment_score >= 50 THEN '3'
+                    ELSE best_grade
+                END
+                WHERE best_grade IS NULL AND assessment_score IS NOT NULL
+                """
+            )
+        )
     _backfill_editions(sync_conn)
+    _renumber_topics(sync_conn)
 
 
 def _backfill_editions(sync_conn) -> None:
@@ -79,3 +104,24 @@ def _backfill_editions(sync_conn) -> None:
                 """
             )
         )
+
+
+def _renumber_topics(sync_conn) -> None:
+    inspector = inspect(sync_conn)
+    if "topics" not in set(inspector.get_table_names()):
+        return
+    rows = sync_conn.execute(
+        text(
+            "SELECT id, track_id, grade FROM topics "
+            "ORDER BY track_id, grade, sort_order, id"
+        )
+    ).fetchall()
+    groups: dict[tuple[int, int], list[int]] = {}
+    for row in rows:
+        groups.setdefault((row[1], row[2]), []).append(row[0])
+    for ids in groups.values():
+        for index, topic_id in enumerate(ids, start=1):
+            sync_conn.execute(
+                text("UPDATE topics SET sort_order = :n WHERE id = :id"),
+                {"n": index, "id": topic_id},
+            )

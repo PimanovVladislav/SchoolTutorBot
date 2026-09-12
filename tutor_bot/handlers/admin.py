@@ -34,10 +34,10 @@ from tutor_bot.keyboards import (
     admin_users_keyboard,
     cancel_kb,
     menu_for,
+    numbered_pick_keyboard,
     NAV_BUTTONS,
 )
 from tutor_bot.services.access import access_label, check_access, is_admin
-from tutor_bot.services.scoring import MASTERY_LABELS
 from tutor_bot.states import Admin
 
 router = Router()
@@ -82,13 +82,11 @@ async def _user_card(session: AsyncSession, user) -> str:
             lines.append("")
             lines.append("<b>Прогресс</b>")
             for topic, progress in rows:
-                if progress is None or progress.assessment_score is None:
+                grade = progress.best_grade if progress else None
+                if not grade:
                     lines.append(f"• {topic.title} — ещё не сдана")
                     continue
-                mastery = MASTERY_LABELS.get(progress.mastery, progress.mastery)
-                lines.append(
-                    f"• {topic.title} — {progress.assessment_score:.0f}% ({mastery})"
-                )
+                lines.append(f"• {topic.title} — оценка {grade}")
     return "\n".join(lines)
 
 
@@ -277,15 +275,38 @@ async def add_topic_theory_text(message: Message, state: FSMContext) -> None:
 
 
 @router.message(Admin.topic_assessment, F.text, ~F.text.in_(NAV_BUTTONS))
-async def add_topic_save(
-    message: Message, state: FSMContext, session: AsyncSession
-) -> None:
+async def add_topic_assessment_count(message: Message, state: FSMContext) -> None:
     raw = (message.text or "").strip()
     try:
         required = int(raw)
     except ValueError:
         await message.answer("Нужно число.")
         return
+    await state.update_data(assessment_required=required)
+    await state.set_state(Admin.topic_number)
+    await message.answer(
+        "Номер темы в этом классе и предмете — так она будет в списке ученика.\n"
+        "«-» — добавить в конец.\n"
+        "Если такой номер уже есть, новая тема займёт его, "
+        "а эта и все следующие сдвинутся вниз."
+    )
+
+
+@router.message(Admin.topic_number, F.text, ~F.text.in_(NAV_BUTTONS))
+async def add_topic_save(
+    message: Message, state: FSMContext, session: AsyncSession
+) -> None:
+    raw = (message.text or "").strip()
+    number = None
+    if raw not in {"-", "нет", "последняя", "в конец"}:
+        try:
+            number = int(raw)
+        except ValueError:
+            await message.answer("Нужно число или «-».")
+            return
+        if number < 1:
+            await message.answer("Номер должен быть от 1, либо «-» для конца списка.")
+            return
     data = await state.get_data()
     track = await repos.default_track_for_subject(session, data["subject_id"])
     if track is None:
@@ -303,7 +324,8 @@ async def add_topic_save(
         theory=first.get("body") or "",
         theory_kind=first.get("kind") or "text",
         theory_image_path=first.get("image_path"),
-        assessment_required=required,
+        assessment_required=int(data.get("assessment_required") or 3),
+        number=number,
     )
     for extra in theories[1:]:
         await repos.add_topic_theory(
@@ -315,8 +337,8 @@ async def add_topic_save(
         )
     await state.clear()
     await message.answer(
-        f"Тема «{escape(topic.title)}» сохранена, id {topic.id}, "
-        f"редакций теории: {len(theories)}.",
+        f"Тема «{escape(topic.title)}» сохранена, номер {topic.sort_order}, "
+        f"id {topic.id}, редакций теории: {len(theories)}.",
         reply_markup=admin_content_menu(),
     )
 
@@ -396,11 +418,14 @@ async def add_problem_grade(
     if not topics:
         await callback.answer("В этом классе нет тем", show_alert=True)
         return
+    catalog, markup = numbered_pick_keyboard(
+        "prob_topic",
+        [(t.id, t.title) for t in topics],
+        numbers=[t.sort_order for t in topics],
+    )
     await callback.message.answer(
-        "Тема:",
-        reply_markup=admin_pick_keyboard(
-            "prob_topic", [(t.id, t.title) for t in topics]
-        ),
+        f"Тема:\n\n{catalog}",
+        reply_markup=markup,
     )
     await callback.answer()
 

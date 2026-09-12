@@ -66,7 +66,9 @@ async def _upsert_topic(session: AsyncSession, track_id: int, spec: dict) -> Top
             theory_kind=spec.get("theory_kind", "text"),
             theory_image_path=spec.get("theory_image_path"),
             assessment_required=int(spec.get("assessment_required", 3)),
-            sort_order=spec["sort_order"],
+            sort_order=await repos.allocate_topic_number(
+                session, track_id, spec["grade"], spec.get("sort_order")
+            ),
         )
         session.add(topic)
         await session.flush()
@@ -77,7 +79,6 @@ async def _upsert_topic(session: AsyncSession, track_id: int, spec: dict) -> Top
     topic.theory_kind = spec.get("theory_kind", "text")
     topic.theory_image_path = spec.get("theory_image_path")
     topic.assessment_required = int(spec.get("assessment_required", 3))
-    topic.sort_order = spec["sort_order"]
     return topic
 
 
